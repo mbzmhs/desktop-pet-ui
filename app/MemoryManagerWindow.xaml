@@ -1,0 +1,89 @@
+<Window x:Class="DesktopPetUi.MemoryManagerWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="记忆管理器"
+        Width="680"
+        Height="540"
+        MinWidth="520"
+        MinHeight="380"
+        WindowStartupLocation="CenterScreen"
+        Topmost="True"
+        ShowInTaskbar="False"
+        Background="#F0F0F0">
+    <DockPanel Margin="10">
+        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="0,8,0,0">
+            <Button Content="清空记忆" Click="OnClearAll"
+                    Background="#B55454" Foreground="White" BorderThickness="0" Padding="12,6" Margin="0,0,8,0"/>
+            <Button x:Name="CompressButton" Content="一键压缩记忆" Click="OnCompress"
+                    Background="#5A5A8A" Foreground="White" BorderThickness="0" Padding="12,6" Margin="0,0,8,0"/>
+            <Button x:Name="SaveButton" Content="保存修改" Click="OnSave"
+                    Background="#3A7A4A" Foreground="White" BorderThickness="0" Padding="12,6" Margin="0,0,8,0"/>
+            <Button Content="关闭" Click="OnClose"
+                    Background="#888" Foreground="White" BorderThickness="0" Padding="12,6"/>
+            <TextBlock x:Name="StatusText" Foreground="#2E8B57" VerticalAlignment="Center" Margin="14,0,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+
+        <StackPanel DockPanel.Dock="Bottom" Margin="0,0,0,8">
+            <TextBlock Text="手动添加对话（输入后点「添加」）" Foreground="#444" FontWeight="Bold"/>
+            <Grid Margin="0,4,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="64"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="你" Foreground="#2A5C8A" FontWeight="Bold" VerticalAlignment="Center"/>
+                <TextBox x:Name="ManualUserBox" Grid.Column="2" MinHeight="30" AcceptsReturn="True" TextWrapping="Wrap"
+                         Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+            </Grid>
+            <Grid Margin="0,4,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="64"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock x:Name="ManualAssistantLabel" Text="角色" Foreground="#7A4AA0" FontWeight="Bold" VerticalAlignment="Center"/>
+                <TextBox x:Name="ManualAssistantBox" Grid.Column="2" MinHeight="30" AcceptsReturn="True" TextWrapping="Wrap"
+                         Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                <Button Grid.Column="3" Content="添加" Click="OnAddManual"
+                        Background="#3A7A4A" Foreground="White" BorderThickness="0"
+                        Padding="12,6" Margin="6,0,0,0" VerticalAlignment="Top"/>
+            </Grid>
+        </StackPanel>
+
+        <TextBlock DockPanel.Dock="Top" Text="记忆摘要（会被注入到对话上下文）" Foreground="#444" Margin="0,0,0,4"/>
+        <TextBox x:Name="SummaryBox" DockPanel.Dock="Top" Height="90" AcceptsReturn="True" TextWrapping="Wrap"
+                 VerticalScrollBarVisibility="Auto"
+                 Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8" Margin="0,0,0,10"/>
+
+        <DockPanel>
+            <TextBlock x:Name="CountText" DockPanel.Dock="Top" Foreground="#444" Margin="0,0,0,4"/>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <ListBox x:Name="HistoryList" Background="#FFFFFF" BorderBrush="#C8C8C8" HorizontalContentAlignment="Stretch">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Margin="0,2">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="64"/>
+                                    <ColumnDefinition Width="86"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="{Binding DisplayRole}" Foreground="#2A5C8A" FontWeight="Bold"
+                                           VerticalAlignment="Top" Margin="0,4,0,0"/>
+                                <TextBlock Grid.Column="1" Text="{Binding Time}" Foreground="#888" FontSize="11"
+                                           VerticalAlignment="Top" Margin="0,5,0,0"/>
+                                <TextBox Grid.Column="2" Text="{Binding Content, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                         TextWrapping="Wrap" AcceptsReturn="True" MinHeight="30"
+                                         Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                                <Button Grid.Column="3" Content="删除" Click="OnDeleteEntry" Tag="{Binding}"
+                                        Background="#B55454" Foreground="White" BorderThickness="0"
+                                        Padding="10,4" Margin="6,0,0,0" VerticalAlignment="Top"/>
+                            </Grid>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </ScrollViewer>
+        </DockPanel>
+    </DockPanel>
+</Window>

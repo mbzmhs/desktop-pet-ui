@@ -1,0 +1,42 @@
+<Window x:Class="DesktopPetUi.PetWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Desktop Pet"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        ResizeMode="NoResize"
+        WindowStartupLocation="Manual"
+        Loaded="OnLoaded">
+    <Grid>
+        <Canvas x:Name="PngCanvas">
+            <Image x:Name="CharacterImageOld"
+                   Stretch="Uniform"
+                   RenderOptions.BitmapScalingMode="HighQuality"
+                   IsHitTestVisible="False"
+                   Canvas.ZIndex="0"/>
+            <Image x:Name="CharacterImage"
+                   Stretch="Uniform"
+                   RenderOptions.BitmapScalingMode="HighQuality"
+                   IsHitTestVisible="True"
+                   Canvas.ZIndex="1"/>
+            <Border x:Name="Bubble"
+                    Canvas.ZIndex="5"
+                    Visibility="Collapsed"
+                    MaxWidth="280"
+                    Background="#E6202020"
+                    CornerRadius="12"
+                    BorderThickness="1"
+                    BorderBrush="#555"
+                    Padding="10,7">
+                <TextBlock x:Name="BubbleText"
+                           Foreground="#FFF"
+                           FontSize="14"
+                           LineHeight="20"
+                           TextWrapping="Wrap"
+                           MaxWidth="260"/>
+            </Border>
+        </Canvas>
+    </Grid>
+</Window>

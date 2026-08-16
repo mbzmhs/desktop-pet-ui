@@ -1,0 +1,12 @@
+# ===== 构建 / 发布产物 =====
+app/bin/
+app/obj/
+out/
+
+# ===== 本地部署脚本（本机专用，不上传） =====
+deploy.sh
+
+# ===== 运行期生成 =====
+config.json
+pet.log
+**/memory.json
