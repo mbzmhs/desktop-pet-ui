@@ -483,16 +483,23 @@ public sealed class ChatPipeline : IDisposable
     private async Task MaybeCompressAsync()
     {
         var max = _config.Chat.ContextLength;
-        if (max <= 0) return;
-        var overflow = _history.Count - max;
-        if (overflow < 2) return;
-        var take = Math.Max(max / 2, 2);
-        if (take >= _history.Count) take = _history.Count / 2;
+        var maxChars = _config.Chat.ContextMaxChars;
+        if (max <= 0 && maxChars <= 0) return;
+
+        var count = _history.Count;
+        var overflowCount = max > 0 ? count - max : 0;
+        var overflowChars = maxChars > 0 ? _history.Sum(m => m.Content?.Length ?? 0) - maxChars : 0;
+        if (overflowCount < 2 && overflowChars <= 0) return;
+
+        var take = max > 0 ? Math.Max(max / 2, 2) : 2;
+        if (take >= count) take = count / 2;
         if (take < 2) return;
 
         var chunk = _history.GetRange(0, take);
         _summary = await CompressAsync(chunk, _summary);
         _history.RemoveRange(0, take);
+        var unit = maxChars > 0 ? "chars" : "n/a";
+        Log.Info($"History compressed: {count} msgs / {unit} -> {_history.Count} msgs");
     }
 
     private async Task<string> CompressAsync(List<ChatMessage> chunk, string? prevSummary)

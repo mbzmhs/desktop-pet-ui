@@ -61,12 +61,13 @@ public partial class ChatWindow : Window
     {
         var w = Width;
         var h = Height;
+        var v = GetVirtualScreen();
         double x, y;
         if (_config.Chat.Ui.PopupFollowsPet && _petRect() is Rect r)
         {
             x = r.Left + (r.Width - w) / 2;
             y = r.Top - h - 8;
-            if (y < 0) y = r.Bottom + 8;
+            if (y < v.Top + 4) y = r.Bottom + 8;
         }
         else
         {
@@ -74,11 +75,28 @@ public partial class ChatWindow : Window
             x = p.X + 16;
             y = p.Y - h - 16;
         }
-        var wa = SystemParameters.WorkArea;
-        x = Math.Clamp(x, wa.Left + 4, wa.Right - w - 4);
-        y = Math.Clamp(y, wa.Top + 4, wa.Bottom - h - 4);
+        var maxX = Math.Max(v.Left + 4, v.Right - w - 4);
+        var maxY = Math.Max(v.Top + 4, v.Bottom - h - 4);
+        x = Math.Clamp(x, v.Left + 4, maxX);
+        y = Math.Clamp(y, v.Top + 4, maxY);
         Left = x;
         Top = y;
+    }
+
+    private Rect GetVirtualScreen()
+    {
+        try
+        {
+            var vs = System.Windows.Forms.SystemInformation.VirtualScreen;
+            var dpi = VisualTreeHelper.GetDpi(this);
+            var s = dpi.DpiScaleX;
+            return new Rect(vs.Left / s, vs.Top / s, vs.Width / s, vs.Height / s);
+        }
+        catch
+        {
+            var wa = SystemParameters.WorkArea;
+            return new Rect(wa.Left, wa.Top, wa.Width, wa.Height);
+        }
     }
 
     private void RefreshHistory()

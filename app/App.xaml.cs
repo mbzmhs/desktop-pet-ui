@@ -63,6 +63,7 @@ public partial class App : System.Windows.Application
         {
             _window = new PetWindow(Config);
             PetWindow = _window;
+            _window.SpeechFinished += OnSpeechFinished;
             SetupTray(_window);
 
             if (Config.Chat.Enabled)
@@ -347,6 +348,21 @@ public partial class App : System.Windows.Application
         catch (Exception ex)
         {
             Log.Error("OnProactiveTick failed", ex);
+        }
+    }
+
+    private void OnSpeechFinished()
+    {
+        try
+        {
+            if (_proactiveTimer == null || !_proactiveTimer.IsEnabled) return;
+            _proactiveTimer.Stop();
+            _proactiveTimer.Start();
+            Log.Info("Proactive countdown restarted after speech");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("OnSpeechFinished failed", ex);
         }
     }
 

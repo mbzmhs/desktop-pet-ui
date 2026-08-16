@@ -412,20 +412,24 @@ public partial class PetWindow : Window, ISpeakHost
         BubbleText.Text = text.Length > 200 ? text[..200] + "…" : text;
         LayoutBubble();
         Bubble.Visibility = Visibility.Visible;
+    }
+
+    /// <summary>按语音时长安排气泡消失与立绘恢复空闲（无语音时按配置时长兜底）。</summary>
+    private void ScheduleSpeechVisuals(double durationSec)
+    {
+        var sec = Math.Max(1, durationSec);
         if (_bubbleTimer == null)
         {
-            _bubbleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(Math.Max(1, _config.Character.BubbleDurationSec)) };
+            _bubbleTimer = new DispatcherTimer();
             _bubbleTimer.Tick += (_, _) => Bubble.Visibility = Visibility.Collapsed;
         }
         _bubbleTimer.Stop();
+        _bubbleTimer.Interval = TimeSpan.FromSeconds(sec);
         _bubbleTimer.Start();
-    }
 
-    private void ScheduleIdleReset()
-    {
         if (_idleResetTimer == null)
         {
-            _idleResetTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(Math.Max(1, _config.Character.BubbleDurationSec)) };
+            _idleResetTimer = new DispatcherTimer();
             _idleResetTimer.Tick += (_, _) =>
             {
                 _idleResetTimer.Stop();
@@ -433,12 +437,30 @@ public partial class PetWindow : Window, ISpeakHost
             };
         }
         _idleResetTimer.Stop();
+        _idleResetTimer.Interval = TimeSpan.FromSeconds(sec);
         _idleResetTimer.Start();
+    }
+
+    /// <summary>语音（流式）播完后立即收起气泡、恢复空闲表情。</summary>
+    private void EndSpeechVisuals()
+    {
+        _bubbleTimer?.Stop();
+        Bubble.Visibility = Visibility.Collapsed;
+        StopIdleReset();
+        ShowIdle();
     }
 
     private void StopIdleReset()
     {
         _idleResetTimer?.Stop();
+    }
+
+    /// <summary>停止上一次语音残留的气泡/空闲定时器，避免旧定时器隐藏新一次回复的气泡。</summary>
+    private void StopSpeechTimers()
+    {
+        _bubbleTimer?.Stop();
+        StopIdleReset();
+        StopIdleCycle();
     }
 
     private void ShowIdle()
@@ -609,11 +631,16 @@ public partial class PetWindow : Window, ISpeakHost
 
     // ---------------- speak ----------------
 
+    /// <summary>一段语音完全播放结束后触发（用于主动搭话计时等）。</summary>
+    public Action? SpeechFinished { get; set; }
+
+    private int _speechSeq;
+
     public async Task SpeakAsync(string? text, byte[]? audio, string? emotion, string? expression)
     {
+        var seq = Interlocked.Increment(ref _speechSeq);
         CancelStream();
-        StopIdleReset();
-        StopIdleCycle();
+        StopSpeechTimers();
         var imgEmotion = string.IsNullOrWhiteSpace(emotion) ? expression : emotion;
         await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
         {
@@ -621,23 +648,33 @@ public partial class PetWindow : Window, ISpeakHost
             if (!string.IsNullOrWhiteSpace(text)) ShowBubble(text);
         });
         if (audio != null && audio.Length > 0)
-            PlayWavAsync(audio);
-        ScheduleIdleReset();
+        {
+            ScheduleSpeechVisuals(TtsClient.EstimateWavDurationSec(audio));
+            _ = Task.Run(() =>
+            {
+                PlaySegment(audio);
+                NotifySpeechFinished(seq, false);
+            });
+        }
+        else
+        {
+            ScheduleSpeechVisuals(_config.Character.BubbleDurationSec);
+            NotifySpeechFinished(seq, false);
+        }
     }
 
     public async Task SpeakStreamAsync(string? text, IAsyncEnumerable<byte[]> audioSegments, string? emotion, string? expression)
     {
+        var seq = Interlocked.Increment(ref _speechSeq);
         CancelStream();
-        StopIdleReset();
-        StopIdleCycle();
+        StopSpeechTimers();
         var imgEmotion = string.IsNullOrWhiteSpace(emotion) ? expression : emotion;
         await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
         {
             ApplyEmotion(imgEmotion);
             if (!string.IsNullOrWhiteSpace(text)) ShowBubble(text);
         });
-        _ = PlayStreamAsync(audioSegments);
-        ScheduleIdleReset();
+        _ = PlayStreamAsync(audioSegments, seq);
     }
 
     private void CancelStream()
@@ -649,9 +686,10 @@ public partial class PetWindow : Window, ISpeakHost
             try { old.Cancel(); } catch { }
             old.Dispose();
         }
+        StopCurrentPlayback();
     }
 
-    private async Task PlayStreamAsync(IAsyncEnumerable<byte[]> segments)
+    private async Task PlayStreamAsync(IAsyncEnumerable<byte[]> segments, int seq)
     {
         var cts = new CancellationTokenSource();
         _streamCts = cts;
@@ -663,10 +701,7 @@ public partial class PetWindow : Window, ISpeakHost
                 {
                     if (cts.IsCancellationRequested) break;
                     if (seg == null || seg.Length == 0) continue;
-                    var durMs = Math.Max(300, (int)Math.Ceiling(TtsClient.EstimateWavDurationSec(seg) * 1000));
-                    PlayWavAsync(seg);
-                    try { await Task.Delay(durMs, cts.Token); }
-                    catch (OperationCanceledException) { break; }
+                    PlaySegment(seg);
                 }
             }
             catch (OperationCanceledException) { }
@@ -677,31 +712,50 @@ public partial class PetWindow : Window, ISpeakHost
             finally
             {
                 if (ReferenceEquals(_streamCts, cts)) _streamCts = null;
+                NotifySpeechFinished(seq, true);
             }
         }, cts.Token);
     }
 
-    private void PlayWavAsync(byte[] wav)
+    /// <summary>同步播放一段 wav 直到结束（PlaySync），播完才返回，避免估算计时截断语音尾部。</summary>
+    private void PlaySegment(byte[] wav)
     {
         StopCurrentPlayback();
         try
         {
             var ms = new MemoryStream(wav);
             var sp = new System.Media.SoundPlayer(ms);
-            sp.Play();
             _currentPlayer = sp;
             _currentStream = ms;
-            var durMs = Math.Max(500, (int)Math.Ceiling(TtsClient.EstimateWavDurationSec(wav) * 1000));
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(durMs);
-                if (ReferenceEquals(_currentPlayer, sp)) StopCurrentPlayback();
-            });
+            sp.PlaySync();
         }
         catch (Exception ex)
         {
             Log.Error("SoundPlayer playback failed", ex);
         }
+        finally
+        {
+            if (_currentStream != null)
+            {
+                try { _currentStream.Dispose(); } catch { }
+                _currentStream = null;
+            }
+            if (_currentPlayer != null) _currentPlayer = null;
+        }
+    }
+
+    private void NotifySpeechFinished(int seq, bool endVisuals)
+    {
+        if (seq != Volatile.Read(ref _speechSeq)) return;
+        try
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (endVisuals) EndSpeechVisuals();
+                SpeechFinished?.Invoke();
+            });
+        }
+        catch { }
     }
 
     private void StopCurrentPlayback()

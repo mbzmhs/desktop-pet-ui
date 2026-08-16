@@ -62,6 +62,7 @@ public sealed class ChatConfig
     public ChatHotkeyConfig Hotkey { get; set; } = new();
     public ChatUiConfig Ui { get; set; } = new();
     public int ContextLength { get; set; } = 20;
+    public int ContextMaxChars { get; set; } = 4000;
     public bool Proactive { get; set; } = false;
     public double ProactiveIntervalSec { get; set; } = 30.0;
     public bool ScreenAware { get; set; } = false;
