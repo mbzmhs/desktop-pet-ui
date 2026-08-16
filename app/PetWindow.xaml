@@ -21,22 +21,40 @@
                    RenderOptions.BitmapScalingMode="HighQuality"
                    IsHitTestVisible="True"
                    Canvas.ZIndex="1"/>
-            <Border x:Name="Bubble"
-                    Canvas.ZIndex="5"
-                    Visibility="Collapsed"
-                    MaxWidth="280"
-                    Background="#E6202020"
-                    CornerRadius="12"
-                    BorderThickness="1"
-                    BorderBrush="#555"
-                    Padding="10,7">
-                <TextBlock x:Name="BubbleText"
-                           Foreground="#FFF"
-                           FontSize="14"
-                           LineHeight="20"
-                           TextWrapping="Wrap"
-                           MaxWidth="260"/>
-            </Border>
+            <Grid x:Name="Bubble"
+                  Canvas.ZIndex="5"
+                  Visibility="Collapsed"
+                  MaxWidth="280">
+                <Border x:Name="BubbleBody"
+                        Background="#FFFFFF"
+                        BorderBrush="#333"
+                        BorderThickness="1.5"
+                        CornerRadius="10"
+                        Padding="10,8">
+                    <TextBlock x:Name="BubbleText"
+                               Foreground="#222"
+                               FontSize="14"
+                               LineHeight="20"
+                               TextWrapping="Wrap"
+                               MaxWidth="260"/>
+                </Border>
+                <Path x:Name="BubbleTailFill"
+                      Fill="#FFFFFF"
+                      HorizontalAlignment="Center"
+                      VerticalAlignment="Bottom"
+                      Margin="0,0,0,-12"
+                      Data="M 0,0 L 16,0 L 8,14 Z"
+                      IsHitTestVisible="False"/>
+                <Path x:Name="BubbleTailStroke"
+                      Stroke="#333"
+                      StrokeThickness="1.5"
+                      StrokeLineJoin="Round"
+                      HorizontalAlignment="Center"
+                      VerticalAlignment="Bottom"
+                      Margin="0,0,0,-12"
+                      Data="M 0,0 L 8,14 L 16,0"
+                      IsHitTestVisible="False"/>
+            </Grid>
         </Canvas>
     </Grid>
 </Window>
