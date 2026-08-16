@@ -87,6 +87,10 @@ public partial class SettingsWindow : Window
             CharTextLangBox.SelectedIndex = CharTagIndex(CharTextLangBox, profile.Tts?.TextLang ?? "auto");
             CharTtsProviderBox.SelectedIndex = CharTagIndex(CharTtsProviderBox, profile.Tts?.Provider ?? "none");
             CharVoiceBox.Text = profile.Tts?.VoiceId ?? "";
+            var charProv = (CharTtsProviderBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "none";
+            CharSpeedSlider.Value = Math.Clamp(profile.Tts?.SpeedFactor ?? 1.0, CharSpeedSlider.Minimum, CharSpeedSlider.Maximum);
+            CharSpeedValueText.Text = CharSpeedSlider.Value.ToString("0.00");
+            CharSpeedSlider.IsEnabled = !string.Equals(charProv, "none", StringComparison.OrdinalIgnoreCase);
             _ = RefreshCharVoicesAsync();
             CharProactiveTempBox.Text = profile.ProactiveTemperature is double p ? p.ToString("0.###") : "0.7";
             CharUserAddressBox.Text = profile.UserAddress ?? "";
@@ -144,10 +148,19 @@ public partial class SettingsWindow : Window
             CharScaleValueText.Text = CharScaleSlider.Value.ToString("0.00");
     }
 
+    private void OnCharSpeedValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (CharSpeedValueText != null)
+            CharSpeedValueText.Text = CharSpeedSlider.Value.ToString("0.00");
+    }
+
     private int _charVoiceRefreshSeq;
 
     private async void OnCharTtsProviderChanged(object sender, SelectionChangedEventArgs e)
     {
+        var prov = (CharTtsProviderBox.SelectedItem as ComboBoxItem)?.Tag as string ?? "none";
+        if (CharSpeedSlider != null)
+            CharSpeedSlider.IsEnabled = !string.Equals(prov, "none", StringComparison.OrdinalIgnoreCase);
         await RefreshCharVoicesAsync(selectFirst: true);
     }
 
@@ -237,6 +250,11 @@ public partial class SettingsWindow : Window
         else if (!string.IsNullOrWhiteSpace(CharVoiceBox.Text))
             voice = CharVoiceBox.Text.Trim();
         if (!string.IsNullOrEmpty(voice)) { tts.VoiceId = voice; hasTts = true; }
+        if (hasTts && !string.Equals(prov, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            tts.SpeedFactor = CharSpeedSlider.Value;
+            hasTts = true;
+        }
         profile.Tts = hasTts ? tts : null;
 
         if (double.TryParse(CharProactiveTempBox.Text?.Trim(), out var pt))
