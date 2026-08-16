@@ -12,6 +12,7 @@
     <LangVersion>latest</LangVersion>
     <Platforms>x64</Platforms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>logo.ico</ApplicationIcon>
     <DebugType>embedded</DebugType>
     <NoWarn>WFAC010</NoWarn>
   </PropertyGroup>
