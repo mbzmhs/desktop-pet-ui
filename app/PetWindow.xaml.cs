@@ -37,6 +37,9 @@ public partial class PetWindow : Window, ISpeakHost
     private double _dispScale;
     private double _dispLeft;
     private double _dispTop;
+    private int _bodyMinX = int.MaxValue;
+    private int _bodyMaxX = -1;
+    private int _bodyMinY = int.MaxValue;
     private double _dpiScale = 1.0;
     private string? _currentImagePath;
     private readonly Random _rng = new();
@@ -304,6 +307,9 @@ public partial class PetWindow : Window, ISpeakHost
             CharacterImage.Source = null;
             _alphaMask = null;
             _imgPxW = _imgPxH = 0;
+            _bodyMinX = int.MaxValue;
+            _bodyMaxX = -1;
+            _bodyMinY = int.MaxValue;
             return;
         }
         var bmp = LoadPng(path, out var w, out var h, out var alpha);
@@ -322,6 +328,7 @@ public partial class PetWindow : Window, ISpeakHost
         _imgPxW = w;
         _imgPxH = h;
         _alphaMask = alpha;
+        ComputeBodyBounds();
         if (doFade)
         {
             CharacterImageOld.Source = oldSrc;
@@ -377,7 +384,9 @@ public partial class PetWindow : Window, ISpeakHost
         var winH = ActualHeight;
         if (winW <= 0 || winH <= 0) return;
         _dpiScale = VisualTreeHelper.GetDpi(this).DpiScaleX;
-        var fit = Math.Min(winW / _imgPxW, winH / _imgPxH);
+        var reserved = Math.Max(0, _config.Character.BubbleReserve);
+        var availH = Math.Max(1, winH - reserved);
+        var fit = Math.Min(winW / _imgPxW, availH / _imgPxH);
         if (fit <= 0 || !double.IsFinite(fit)) fit = 1;
         fit *= _config.EffectiveScale;
         _dispScale = fit;
@@ -404,6 +413,32 @@ public partial class PetWindow : Window, ISpeakHost
         if (x >= _imgPxW || y >= _imgPxH) return 0;
         if (_alphaMask == null) return 255; // no mask: treat image bounds as opaque
         return _alphaMask[y * _imgPxW + x];
+    }
+
+    /// <summary>计算立绘不透明像素的外接矩形（像素坐标），用于让气泡贴着头顶、不覆盖立绘。</summary>
+    private void ComputeBodyBounds()
+    {
+        _bodyMinX = int.MaxValue;
+        _bodyMaxX = -1;
+        _bodyMinY = int.MaxValue;
+        if (_alphaMask == null || _imgPxW <= 0 || _imgPxH <= 0) return;
+        for (var y = 0; y < _imgPxH; y++)
+        {
+            var row = y * _imgPxW;
+            for (var x = 0; x < _imgPxW; x++)
+            {
+                if (_alphaMask[row + x] < 8) continue; // 忽略接近透明的噪点
+                if (x < _bodyMinX) _bodyMinX = x;
+                if (x > _bodyMaxX) _bodyMaxX = x;
+                if (y < _bodyMinY) _bodyMinY = y;
+            }
+        }
+        if (_bodyMinX > _bodyMaxX)
+        {
+            _bodyMinX = 0;
+            _bodyMaxX = _imgPxW - 1;
+            _bodyMinY = 0;
+        }
     }
 
     public void ShowBubble(string? text)
@@ -522,9 +557,28 @@ public partial class PetWindow : Window, ISpeakHost
         Bubble.UpdateLayout();
         var bw = Bubble.ActualWidth;
         var bh = Bubble.ActualHeight;
-        var cx = (ActualWidth - bw) / 2;
-        Canvas.SetLeft(Bubble, Math.Max(4, Math.Min(ActualWidth - bw - 4, cx)));
-        Canvas.SetTop(Bubble, Math.Max(4, _dispTop - bh - 4));
+        var winW = ActualWidth;
+
+        // 头顶位置：不透明像素外接框顶部；无遮罩时退回立绘显示区顶部
+        double headTopY, headCenterX;
+        if (_bodyMinY < int.MaxValue && _dispScale > 0)
+        {
+            headTopY = _dispTop + _bodyMinY * _dispScale;
+            headCenterX = _dispLeft + (_bodyMinX + _bodyMaxX) / 2.0 * _dispScale;
+        }
+        else
+        {
+            headTopY = _dispTop;
+            headCenterX = winW / 2.0;
+        }
+
+        const double headGap = 4;        // 尾巴尖到头顶的间距
+        const double tailExtent = 12;    // 尾巴在气泡底部之下伸出的长度（与 XAML 中的 Margin 对应）
+
+        var left = Math.Max(4, Math.Min(winW - bw - 4, headCenterX - bw / 2));
+        var top = Math.Max(4, headTopY - bh - headGap - tailExtent);
+        Canvas.SetLeft(Bubble, left);
+        Canvas.SetTop(Bubble, top);
         Canvas.SetZIndex(Bubble, 5);
     }
 
