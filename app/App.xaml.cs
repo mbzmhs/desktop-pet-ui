@@ -147,6 +147,18 @@ public partial class App : System.Windows.Application
         }
     }
 
+    private static System.Drawing.Icon ExtractAppIcon()
+    {
+        try
+        {
+            var path = Environment.ProcessPath;
+            if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                return System.Drawing.Icon.ExtractAssociatedIcon(path) ?? System.Drawing.SystemIcons.Application;
+        }
+        catch { }
+        return System.Drawing.SystemIcons.Application;
+    }
+
     private void SetupTray(PetWindow win)
     {
         _trayMenu = new System.Windows.Forms.ContextMenuStrip();
@@ -155,7 +167,7 @@ public partial class App : System.Windows.Application
 
         _tray = new NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = ExtractAppIcon(),
             Text = "Desktop Pet",
             ContextMenuStrip = _trayMenu,
             Visible = true,
