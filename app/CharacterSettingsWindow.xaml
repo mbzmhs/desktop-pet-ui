@@ -1,0 +1,106 @@
+<Window x:Class="DesktopPetUi.CharacterSettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="角色设置"
+        Width="470"
+        SizeToContent="Height"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        Background="#F5F5F5">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16">
+            <Grid Margin="0,0,0,12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="角色" Foreground="#444" VerticalAlignment="Center"/>
+                <ComboBox x:Name="CharacterBox" Grid.Column="2" SelectionChanged="OnCharacterChanged"
+                          Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+            </Grid>
+
+            <TextBlock Text="TTS 语音（per 角色，参考 tts-server speed_factor）" Foreground="#2A5C8A" FontWeight="Bold" Margin="0,0,0,8"/>
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="语音服务" Foreground="#444" VerticalAlignment="Center"/>
+                <ComboBox x:Name="ProviderBox" Grid.Column="2" SelectionChanged="OnProviderChanged"
+                          Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8">
+                    <ComboBoxItem Content="无语音" Tag="none"/>
+                    <ComboBoxItem Content="GPT-SoVITS（本地）" Tag="gptsovits"/>
+                    <ComboBoxItem Content="Windows 系统语音" Tag="windows"/>
+                </ComboBox>
+            </Grid>
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="服务器地址" Foreground="#444" VerticalAlignment="Center"/>
+                <TextBox x:Name="UrlBox" Grid.Column="2" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+            </Grid>
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="音色 ID" Foreground="#444" VerticalAlignment="Center"/>
+                <TextBox x:Name="VoiceIdBox" Grid.Column="2" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+            </Grid>
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="语言" Foreground="#444" VerticalAlignment="Center"/>
+                <ComboBox x:Name="TextLangBox" Grid.Column="2" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8">
+                    <ComboBoxItem Content="自动" Tag="auto"/>
+                    <ComboBoxItem Content="中文" Tag="zh"/>
+                    <ComboBoxItem Content="日文" Tag="ja"/>
+                    <ComboBoxItem Content="英文" Tag="en"/>
+                </ComboBox>
+            </Grid>
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="情感（默认标签）" Foreground="#444" VerticalAlignment="Center"/>
+                <TextBox x:Name="EmotionBox" Grid.Column="2" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+            </Grid>
+            <CheckBox x:Name="StreamingCheck" Content="流式合成（逐句边收边播，仅 GPT-SoVITS 生效）" Foreground="#222" Margin="0,0,0,8"/>
+
+            <Grid Margin="0,0,0,4">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="语速" Foreground="#444" VerticalAlignment="Center"/>
+                <Slider x:Name="SpeedSlider" Grid.Column="2" Minimum="0.5" Maximum="2.0" TickFrequency="0.05"
+                        IsSnapToTickEnabled="True" VerticalAlignment="Center" ValueChanged="OnSpeedChanged"/>
+                <TextBlock x:Name="SpeedValueText" Grid.Column="3" Foreground="#444" VerticalAlignment="Center"
+                           Margin="8,0,0,0" MinWidth="42" TextAlignment="Right"/>
+            </Grid>
+            <TextBlock Text="语速参考：0.8–1.2 较自然（tts-server 的 speed_factor 参数，默认 1.0）"
+                       Foreground="#888" FontSize="11" Margin="0,0,0,12" TextWrapping="Wrap"/>
+
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="保存" Click="OnSave"
+                        Background="#3A7A4A" Foreground="White" BorderThickness="0" Padding="16,7" Margin="0,0,8,0"/>
+                <Button Content="关闭" Click="OnClose"
+                        Background="#5A5A8A" Foreground="White" BorderThickness="0" Padding="16,7"/>
+            </StackPanel>
+            <TextBlock x:Name="StatusText" Foreground="#2E8B57" Margin="0,8,0,0" TextWrapping="Wrap"/>
+        </StackPanel>
+    </ScrollViewer>
+</Window>

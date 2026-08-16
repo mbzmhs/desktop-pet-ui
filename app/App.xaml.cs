@@ -19,6 +19,7 @@ public partial class App : System.Windows.Application
     private PetWindow? _window;
     private ChatWindow? _chatWindow;
     private SettingsWindow? _settingsWindow;
+    private CharacterSettingsWindow? _characterSettingsWindow;
     private DebugWindow? _debugWindow;
     private MemoryManagerWindow? _memoryWindow;
     private ChatPipeline? _chatPipeline;
@@ -204,6 +205,8 @@ public partial class App : System.Windows.Application
 
         var settings = new System.Windows.Forms.ToolStripMenuItem("设置…");
         settings.Click += (_, _) => Dispatcher.Invoke(OpenSettingsWindow);
+        var charSettings = new System.Windows.Forms.ToolStripMenuItem("角色设置…");
+        charSettings.Click += (_, _) => Dispatcher.Invoke(OpenCharacterSettingsWindow);
         var debug = new System.Windows.Forms.ToolStripMenuItem("调试窗口");
         debug.Click += (_, _) => Dispatcher.Invoke(OpenDebugWindow);
         var show = new System.Windows.Forms.ToolStripMenuItem("显示/隐藏");
@@ -244,6 +247,17 @@ public partial class App : System.Windows.Application
         }
         _settingsWindow.Show();
         _settingsWindow.Activate();
+    }
+
+    private void OpenCharacterSettingsWindow()
+    {
+        if (_characterSettingsWindow == null)
+        {
+            _characterSettingsWindow = new CharacterSettingsWindow(Config, _window);
+            _characterSettingsWindow.Closed += (_, _) => _characterSettingsWindow = null;
+        }
+        _characterSettingsWindow.Show();
+        _characterSettingsWindow.Activate();
     }
 
     private void OpenDebugWindow()
