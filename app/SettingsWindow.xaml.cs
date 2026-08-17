@@ -325,6 +325,7 @@ ExtraParamsBox.Text = CurrentProviderExtra();
         ScreenAwareCheck.IsChecked = _config.Chat.ScreenAware;
         ScreenAwareChanceBox.Text = _config.Chat.ScreenAwareChance.ToString("0.##");
         CrossFadeCheck.IsChecked = _config.Character.CrossFade;
+        ReadInnerThoughtsCheck.IsChecked = _config.Chat.ReadInnerThoughts;
         GlobalUserAddressBox.Text = _config.Chat.UserAddress;
         BubbleDurationSlider.Value = Math.Clamp(_config.Character.BubbleDurationSec, BubbleDurationSlider.Minimum, BubbleDurationSlider.Maximum);
         BubbleDurationValueText.Text = BubbleDurationSlider.Value.ToString("0.#");
@@ -429,6 +430,7 @@ ExtraParamsBox.Text = CurrentProviderExtra();
             if (double.TryParse(ScreenAwareChanceBox.Text?.Trim(), out var sac) && sac >= 0 && sac <= 1)
                 _config.Chat.ScreenAwareChance = sac;
             _config.Character.CrossFade = CrossFadeCheck.IsChecked == true;
+            _config.Chat.ReadInnerThoughts = ReadInnerThoughtsCheck.IsChecked == true;
             _config.Character.BubbleDurationSec = BubbleDurationSlider.Value;
             _config.Chat.UserAddress = GlobalUserAddressBox.Text?.Trim() ?? "";
 

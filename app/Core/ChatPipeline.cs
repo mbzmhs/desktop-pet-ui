@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -311,6 +312,9 @@ public sealed class ChatPipeline : IDisposable
             var (specs, fullText) = await PlanSegmentsAsync(rawReply);
             await SpeakPlannedAsync(host, fullText, specs);
 
+            // 把系统生成的沉默回合作为 user 消息一并记入历史，保证历史中 user/assistant 交替，
+            // 避免连续堆积 assistant 发言导致模型下次误以为要说很长一段。
+            _history.Add(new ChatMessage { Role = "user", Content = silence });
             _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             await MaybeCompressAsync();
             NotifyHistory();
@@ -420,8 +424,8 @@ public sealed class ChatPipeline : IDisposable
             if (emo != null && !available.Any(x => x.Equals(emo, StringComparison.OrdinalIgnoreCase))) emo = null;
             if (string.IsNullOrWhiteSpace(emo)) emo = tts.Emotion;
             var ttsEmo = (await ResolveTtsEmotionAsync(emo)) ?? "neutral";
-            var spec = new SpeechSegmentSpec { Emotion = emo, TtsEmotion = ttsEmo, Text = text };
-            return (new List<SpeechSegmentSpec> { spec }, spec.Text);
+            var spec = new SpeechSegmentSpec { Emotion = emo, TtsEmotion = ttsEmo, Text = TtsText(text) };
+            return (new List<SpeechSegmentSpec> { spec }, text);
         }
 
         var resolved = new List<SpeechSegmentSpec>();
@@ -431,21 +435,31 @@ public sealed class ChatPipeline : IDisposable
             if (emo != null && !available.Any(x => x.Equals(emo, StringComparison.OrdinalIgnoreCase))) emo = null;
             if (string.IsNullOrWhiteSpace(emo)) emo = tts.Emotion;
             var ttsEmo = (await ResolveTtsEmotionAsync(emo)) ?? "neutral";
+            var ttsText = TtsText(text);
+            if (string.IsNullOrWhiteSpace(ttsText)) continue;
             var last = resolved.Count > 0 ? resolved[^1] : null;
             if (last != null &&
                 last.Emotion.Equals(emo, StringComparison.OrdinalIgnoreCase) &&
                 last.TtsEmotion.Equals(ttsEmo, StringComparison.OrdinalIgnoreCase))
             {
-                last.Text += text;
+                last.Text += ttsText;
             }
             else
             {
-                resolved.Add(new SpeechSegmentSpec { Emotion = emo, TtsEmotion = ttsEmo, Text = text });
+                resolved.Add(new SpeechSegmentSpec { Emotion = emo, TtsEmotion = ttsEmo, Text = ttsText });
             }
         }
         var fullText = string.Concat(parts.Select(p => p.Text));
         return (resolved, fullText);
     }
+
+    /// <summary>发送给 TTS 的文本：按全局「朗读内心想法」开关决定是否剔除 （）() 括号内的内心想法。</summary>
+    private string TtsText(string text)
+        => _config.Chat.ReadInnerThoughts ? text : StripInnerThoughts(text);
+
+    /// <summary>剔除 （）() 和 【】 内的内心想法 / 小动作内容。</summary>
+    private static string StripInnerThoughts(string text)
+        => Regex.Replace(text, "[（(【][^（）()【】]*[）)】]", "").Trim();
 
     /// <summary>按说话计划播放：单段沿用旧的单情感路径；多段走分段并行播放。</summary>
     private async Task SpeakPlannedAsync(ISpeakHost host, string fullText, IReadOnlyList<SpeechSegmentSpec> specs)

@@ -54,6 +54,7 @@ public sealed class ChatConfig
     public bool Enabled { get; set; } = true;
     public ChatLlamaConfig Llama { get; set; } = new();
     public ChatTtsConfig Tts { get; set; } = new();
+    public bool ReadInnerThoughts { get; set; } = false; // 是否朗读 （）() 和 【】 内的内心想法/小动作；false 时发送给 TTS 的文本剔除括号内容
     public ChatHotkeyConfig Hotkey { get; set; } = new();
     public ChatUiConfig Ui { get; set; } = new();
     public int ContextLength { get; set; } = 20;
