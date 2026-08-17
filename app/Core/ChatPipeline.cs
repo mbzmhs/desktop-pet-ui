@@ -26,6 +26,8 @@ public sealed class ChatPipeline : IDisposable
     private DateTime _emotionsFetchedAt;
 
     private static readonly string[] Weekdays = { "日", "一", "二", "三", "四", "五", "六" };
+    private static readonly string[] WeekdaysJa = { "日曜日", "月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日" };
+    private static readonly string[] WeekdaysEn = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 
     public Action<string>? Status { get; set; }
     public Action<string>? DebugLog { get; set; }
@@ -71,19 +73,69 @@ public sealed class ChatPipeline : IDisposable
         var parts = new List<string>();
         if (!string.IsNullOrWhiteSpace(_config.EffectiveSystemPrompt))
             parts.Add(_config.EffectiveSystemPrompt);
+        var lang = CharacterLang();
+        parts.Add(lang == "ja"
+            ? "【言語ルール】ユーザーがどの言語で話しかけても、あなたは必ず日本語で返答してください。絶対にユーザーの言語に合わせてはいけません。"
+            : lang == "en"
+                ? "【Language rule】No matter what language the user speaks, always reply in English. Never switch to the user's language."
+                : "【语言规则】无论用户用什么语言说话，你都必须用中文回复，绝不能跟着用户换语言。");
         var now = DateTime.Now;
-        parts.Add("【当前时间】" + now.ToString("yyyy年M月d日") + " 星期" + Weekdays[(int)now.DayOfWeek] + " " + now.ToString("HH:mm"));
+        if (lang == "ja")
+        {
+            parts.Add("【現在時刻】現在は" + now.ToString("yyyy年M月d日") + "（" + WeekdaysJa[(int)now.DayOfWeek] + "）" + now.ToString("HH:mm") + "です。");
+        }
+        else if (lang == "en")
+        {
+            parts.Add("【Current time】It is " + now.ToString("yyyy-MM-dd") + " (" + WeekdaysEn[(int)now.DayOfWeek] + ") " + now.ToString("HH:mm") + ".");
+        }
+        else
+        {
+            parts.Add("【当前时间】" + now.ToString("yyyy年M月d日") + " 星期" + Weekdays[(int)now.DayOfWeek] + " " + now.ToString("HH:mm"));
+        }
         var address = _config.EffectiveUserAddress;
         if (!string.IsNullOrWhiteSpace(address))
-            parts.Add("【对用户的称呼】请用「" + address + "」来称呼用户。");
+        {
+            parts.Add(lang == "ja"
+                ? "【ユーザーの呼び方】ユーザーのことを「" + address + "」と呼んでください。"
+                : lang == "en"
+                    ? "【Addressing the user】Address the user as \"" + address + "\"."
+                    : "【对用户的称呼】请用「" + address + "」来称呼用户。");
+        }
         if (!string.IsNullOrWhiteSpace(_screenNote))
-            parts.Add("【宠物此刻观察到的用户桌面画面】\n" + Truncate(_screenNote, 400));
+        {
+            parts.Add(lang == "ja"
+                ? "【今観察しているユーザーのデスクトップ画面】\n" + Truncate(_screenNote, 400)
+                : lang == "en"
+                    ? "【What the pet currently observes on the user's desktop】\n" + Truncate(_screenNote, 400)
+                    : "【宠物此刻观察到的用户桌面画面】\n" + Truncate(_screenNote, 400));
+        }
         if (!string.IsNullOrWhiteSpace(_summary))
-            parts.Add("【过去的记忆摘要】以下是更早之前对话的记忆摘要，属于已经过去的事，不是刚刚发生的。可以引用它延续人设，但请以当前对话为准。\n" + _summary);
-        var emoLine = AvailableEmotionLine();
+        {
+            parts.Add(lang == "ja"
+                ? "【過去の記憶まとめ】以下はもっと前の会話の記憶要約で、既に過ぎ去った過去の出来事です。直前に起きたことではありません。キャラを保つために引用しても構いませんが、現在の会話を優先してください。\n" + _summary
+                : lang == "en"
+                    ? "【Memory summary from the past】The following is a summary of memories from earlier conversations; these are already in the past, not just now. You may reference it to stay in character, but prioritize the current conversation.\n" + _summary
+                    : "【过去的记忆摘要】以下是更早之前对话的记忆摘要，属于已经过去的事，不是刚刚发生的。可以引用它延续人设，但请以当前对话为准。\n" + _summary);
+        }
+        var emoLine = AvailableEmotionLine(lang);
         if (!string.IsNullOrWhiteSpace(emoLine))
             parts.Add(emoLine);
         return string.Join("\n\n", parts);
+    }
+
+    /// <summary>角色语言：优先用 TTS 的 text_lang（zh/ja/en），未明确时按系统提示词内容推断。</summary>
+    private string CharacterLang()
+    {
+        var lang = _config.EffectiveTextLang;
+        if (lang == "zh" || lang == "ja" || lang == "en") return lang;
+        var sys = _config.EffectiveSystemPrompt;
+        if (string.IsNullOrWhiteSpace(sys)) return "zh";
+        foreach (var c in sys)
+        {
+            if (c >= '\u3040' && c <= '\u30ff') return "ja";   // 假名
+            if (c >= '\u4e00' && c <= '\u9fff') return "zh";   // 汉字
+        }
+        return "en";
     }
 
     /// <summary>当前角色文件夹下可用于展示的情感子文件夹（排除 idle）。</summary>
@@ -111,11 +163,15 @@ public sealed class ChatPipeline : IDisposable
         }
     }
 
-    private string? AvailableEmotionLine()
+    private string? AvailableEmotionLine(string lang)
     {
         var emotions = CharacterEmotions() ?? ChatEmotion.Emotions;
-        return "【情感标签】你的回复结尾必须附上1个情感标签，只能从以下可选标签中选择：" +
-               string.Join(" ", emotions.Select(x => "[" + x + "]"));
+        var list = string.Join(" ", emotions.Select(x => "[" + x + "]"));
+        return lang == "ja"
+            ? "【感情タグ】返答の途中に感情タグを挿入して感情を切り替えられます。例：「[angry]ひどいよ！[happy]冗談だよ」。タグは読み上げられず、会話途中の立ち絵の感情切り替えにのみ使われます。文末にタグは付けないでください（無効）。1回の返答につき1〜3個で十分です。使えるタグ：" + list
+            : lang == "en"
+                ? "【Emotion tags】Insert an emotion tag anywhere in your reply to switch emotion mid-speech, e.g. '[angry]How could you! [happy]Just kidding.'. Tags are not read aloud and only switch the character's expression mid-speech. Do not append a tag at the end (ignored). 1-3 tags per reply is enough. Available tags: " + list
+                : "【情感标签】你可以在回复中途任意位置插入情感标签来切换情绪，例如「[angry]你怎么这样！[happy]开玩笑的啦」。标签不会被朗读，只在说话中途切换立绘情绪；结尾不要加标签（无效），每次回复插入 1~3 个即可，不要每句都标。只能从以下可选标签中选择：" + list;
     }
 
     private async Task EnsureEmotionsAsync()
@@ -212,47 +268,8 @@ public sealed class ChatPipeline : IDisposable
             _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             NotifyHistory();
 
-            var (emotion, reply) = ResolveEmotionAsync(rawReply);
-            var ttsEmotion = await ResolveTtsEmotionAsync(emotion);
-
-            Status?.Invoke("合成语音…");
-            var tts = _config.EffectiveTts();
-            var useStream = !string.Equals(tts.Provider, "none", StringComparison.OrdinalIgnoreCase) &&
-                            tts.Streaming &&
-                            string.Equals(tts.Provider, "gptsovits", StringComparison.OrdinalIgnoreCase);
-            if (useStream)
-            {
-                try
-                {
-                    await host.SpeakStreamAsync(reply,
-                        TtsClient.SynthesizeStreamAsync(tts.Url, reply, tts, ttsEmotion),
-                        emotion, expression: null);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error("TTS stream failed (bubble still shown)", ex);
-                    Status?.Invoke("语音合成失败，仅显示文字…");
-                }
-            }
-            else
-            {
-                byte[]? audio = null;
-                if (!string.Equals(tts.Provider, "none", StringComparison.OrdinalIgnoreCase))
-                {
-                    try
-                    {
-                        (audio, _) = await TtsClient.SynthesizeAsync(tts.Url, reply, tts, ttsEmotion);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Error("TTS failed (bubble still shown)", ex);
-                        Status?.Invoke("语音合成失败，仅显示文字…");
-                        audio = null;
-                    }
-                }
-                Status?.Invoke(audio != null ? "播放中…" : "");
-                await host.SpeakAsync(reply, audio, emotion, expression: null);
-            }
+            var (specs, fullText) = await PlanSegmentsAsync(rawReply);
+            await SpeakPlannedAsync(host, fullText, specs);
 
             await MaybeCompressAsync();
             NotifyHistory();
@@ -291,46 +308,8 @@ public sealed class ChatPipeline : IDisposable
             }
             _lastProactive = rawReply;
 
-            var (emotion, reply) = ResolveEmotionAsync(rawReply);
-            var ttsEmotion = await ResolveTtsEmotionAsync(emotion);
-
-            Status?.Invoke("合成语音…");
-            var tts = _config.EffectiveTts();
-            var useStream = !string.Equals(tts.Provider, "none", StringComparison.OrdinalIgnoreCase) &&
-                            tts.Streaming &&
-                            string.Equals(tts.Provider, "gptsovits", StringComparison.OrdinalIgnoreCase);
-            if (useStream)
-            {
-                try
-                {
-                    await host.SpeakStreamAsync(reply,
-                        TtsClient.SynthesizeStreamAsync(tts.Url, reply, tts, ttsEmotion),
-                        emotion, expression: null);
-                }
-                catch (Exception ex)
-                {
-                    Log.Error("TTS stream failed (bubble still shown)", ex);
-                    Status?.Invoke("语音合成失败，仅显示文字…");
-                }
-            }
-            else
-            {
-                byte[]? audio = null;
-                if (!string.Equals(tts.Provider, "none", StringComparison.OrdinalIgnoreCase))
-                {
-                    try
-                    {
-                        (audio, _) = await TtsClient.SynthesizeAsync(tts.Url, reply, tts, ttsEmotion);
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.Error("TTS failed (bubble still shown)", ex);
-                        Status?.Invoke("语音合成失败，仅显示文字…");
-                        audio = null;
-                    }
-                }
-                await host.SpeakAsync(reply, audio, emotion, expression: null);
-            }
+            var (specs, fullText) = await PlanSegmentsAsync(rawReply);
+            await SpeakPlannedAsync(host, fullText, specs);
 
             _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             await MaybeCompressAsync();
@@ -428,16 +407,93 @@ public sealed class ChatPipeline : IDisposable
         return "[" + DateTime.Now.ToString("HH:mm:ss") + "] ← llama 回复:\n" + reply;
     }
 
-    private (string? emotion, string reply) ResolveEmotionAsync(string rawReply)
+    /// <summary>把回复拆成（可能的）分段说话计划：单段沿用旧的单情感解析；多段逐段解析、校验情绪并合并相邻同情感。</summary>
+    private async Task<(List<SpeechSegmentSpec> Specs, string FullText)> PlanSegmentsAsync(string rawReply)
     {
         var tts = _config.EffectiveTts();
-        var (emotion, reply) = ChatEmotion.Parse(rawReply);
         var available = CharacterEmotions() ?? ChatEmotion.Emotions;
-        if (emotion != null &&
-            !available.Any(x => x.Equals(emotion, StringComparison.OrdinalIgnoreCase)))
-            emotion = null;
-        if (string.IsNullOrWhiteSpace(emotion)) emotion = tts.Emotion;
-        return (emotion, reply);
+        var parts = ChatEmotion.ParseSegments(rawReply);
+
+        if (parts.Count <= 1)
+        {
+            var (emo, text) = ChatEmotion.Parse(rawReply);
+            if (emo != null && !available.Any(x => x.Equals(emo, StringComparison.OrdinalIgnoreCase))) emo = null;
+            if (string.IsNullOrWhiteSpace(emo)) emo = tts.Emotion;
+            var ttsEmo = (await ResolveTtsEmotionAsync(emo)) ?? "neutral";
+            var spec = new SpeechSegmentSpec { Emotion = emo, TtsEmotion = ttsEmo, Text = text };
+            return (new List<SpeechSegmentSpec> { spec }, spec.Text);
+        }
+
+        var resolved = new List<SpeechSegmentSpec>();
+        foreach (var (e, text) in parts)
+        {
+            var emo = e;
+            if (emo != null && !available.Any(x => x.Equals(emo, StringComparison.OrdinalIgnoreCase))) emo = null;
+            if (string.IsNullOrWhiteSpace(emo)) emo = tts.Emotion;
+            var ttsEmo = (await ResolveTtsEmotionAsync(emo)) ?? "neutral";
+            var last = resolved.Count > 0 ? resolved[^1] : null;
+            if (last != null &&
+                last.Emotion.Equals(emo, StringComparison.OrdinalIgnoreCase) &&
+                last.TtsEmotion.Equals(ttsEmo, StringComparison.OrdinalIgnoreCase))
+            {
+                last.Text += text;
+            }
+            else
+            {
+                resolved.Add(new SpeechSegmentSpec { Emotion = emo, TtsEmotion = ttsEmo, Text = text });
+            }
+        }
+        var fullText = string.Concat(parts.Select(p => p.Text));
+        return (resolved, fullText);
+    }
+
+    /// <summary>按说话计划播放：单段沿用旧的单情感路径；多段走分段并行播放。</summary>
+    private async Task SpeakPlannedAsync(ISpeakHost host, string fullText, IReadOnlyList<SpeechSegmentSpec> specs)
+    {
+        Status?.Invoke("合成语音…");
+        var tts = _config.EffectiveTts();
+        var useStream = !string.Equals(tts.Provider, "none", StringComparison.OrdinalIgnoreCase) &&
+                        tts.Streaming &&
+                        string.Equals(tts.Provider, "gptsovits", StringComparison.OrdinalIgnoreCase);
+        if (specs.Count == 1)
+        {
+            var spec = specs[0];
+            if (useStream)
+            {
+                try
+                {
+                    await host.SpeakStreamAsync(fullText,
+                        TtsClient.SynthesizeStreamAsync(tts.Url, spec.Text, tts, spec.TtsEmotion, stopPrev: true),
+                        spec.Emotion, expression: null);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("TTS stream failed (bubble still shown)", ex);
+                    Status?.Invoke("语音合成失败，仅显示文字…");
+                }
+                return;
+            }
+
+            byte[]? audio = null;
+            if (!string.Equals(tts.Provider, "none", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    (audio, _) = await TtsClient.SynthesizeAsync(tts.Url, spec.Text, tts, spec.TtsEmotion);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("TTS failed (bubble still shown)", ex);
+                    Status?.Invoke("语音合成失败，仅显示文字…");
+                    audio = null;
+                }
+            }
+            Status?.Invoke(audio != null ? "播放中…" : "");
+            await host.SpeakAsync(fullText, audio, spec.Emotion, expression: null);
+            return;
+        }
+
+        await host.SpeakSegmentsAsync(fullText, specs);
     }
 
     /// <summary>仅当 TTS 服务器不支持所选情感时，回退为 neutral。</summary>

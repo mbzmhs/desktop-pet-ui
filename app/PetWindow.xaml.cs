@@ -755,6 +755,169 @@ public partial class PetWindow : Window, ISpeakHost
         _ = PlayStreamAsync(audioSegments, seq);
     }
 
+    public async Task SpeakSegmentsAsync(string? fullText, IReadOnlyList<SpeechSegmentSpec> segments)
+    {
+        var seq = Interlocked.Increment(ref _speechSeq);
+        CancelStream();
+        StopSpeechTimers();
+        var firstEmotion = segments.Count > 0 ? segments[0].Emotion : null;
+        await System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+        {
+            ApplyEmotion(firstEmotion);
+            if (!string.IsNullOrWhiteSpace(fullText)) ShowBubble(fullText);
+            SpeechStarted?.Invoke();
+        });
+        if (segments.Count == 0)
+        {
+            ScheduleSpeechVisuals(_config.Character.BubbleDurationSec);
+            NotifySpeechFinished(seq, false);
+            return;
+        }
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var tts = _config.EffectiveTts();
+                var isStream = string.Equals(tts.Provider, "gptsovits", StringComparison.OrdinalIgnoreCase) && tts.Streaming;
+                if (isStream)
+                    await PlaySegmentsStreamingAsync(seq, segments, tts);
+                else if (!string.Equals(tts.Provider, "none", StringComparison.OrdinalIgnoreCase))
+                    await PlaySegmentsSynthesizedAsync(seq, segments, tts);
+                else
+                    await PlaySegmentsProportionalAsync(seq, segments, _config.Character.BubbleDurationSec);
+                NotifySpeechFinished(seq, true);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Segmented speech failed", ex);
+                NotifySpeechFinished(seq, true);
+            }
+        });
+    }
+
+    /// <summary>分段流式播放：仅第一段请求带 stop_prev 并等它被服务端注册后，再并行发出其余段请求，避免误杀自己。</summary>
+    private async Task PlaySegmentsStreamingAsync(int seq, IReadOnlyList<SpeechSegmentSpec> segments, ChatTtsConfig tts)
+    {
+        var cts = new CancellationTokenSource();
+        if (seq != Volatile.Read(ref _speechSeq)) return;
+        _streamCts = cts;
+        try
+        {
+            var url = tts.Url;
+            var buffered = new (IAsyncEnumerable<byte[]> Stream, Task Ready)[segments.Count];
+            buffered[0] = TtsClient.StartStreamingBuffered(url, segments[0].Text, tts, segments[0].TtsEmotion, stopPrev: true, cts.Token);
+            await buffered[0].Ready.WaitAsync(cts.Token);
+            if (seq != Volatile.Read(ref _speechSeq)) return;
+            for (var i = 1; i < segments.Count; i++)
+            {
+                if (seq != Volatile.Read(ref _speechSeq)) return;
+                buffered[i] = TtsClient.StartStreamingBuffered(url, segments[i].Text, tts, segments[i].TtsEmotion, stopPrev: false, cts.Token);
+            }
+
+            for (var i = 0; i < segments.Count; i++)
+            {
+                if (seq != Volatile.Read(ref _speechSeq)) return;
+                await System.Windows.Application.Current.Dispatcher.InvokeAsync(() => ApplyEmotion(segments[i].Emotion));
+                await foreach (var chunk in buffered[i].Stream.WithCancellation(cts.Token))
+                {
+                    if (seq != Volatile.Read(ref _speechSeq)) return;
+                    if (chunk == null || chunk.Length == 0) continue;
+                    PlaySegment(chunk);
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Log.Error("Segmented stream TTS playback failed", ex);
+        }
+        finally
+        {
+            if (ReferenceEquals(_streamCts, cts)) _streamCts = null;
+        }
+    }
+
+    /// <summary>分段非流式播放：各段并行合成后按序播放；某段合成失败则按文本比例停顿兜底。</summary>
+    private async Task PlaySegmentsSynthesizedAsync(int seq, IReadOnlyList<SpeechSegmentSpec> segments, ChatTtsConfig tts)
+    {
+        var cts = new CancellationTokenSource();
+        if (seq != Volatile.Read(ref _speechSeq)) return;
+        _streamCts = cts;
+        try
+        {
+            var audio = new byte[segments.Count][];
+            var tasks = new Task[segments.Count];
+            for (var i = 0; i < segments.Count; i++)
+            {
+                var idx = i;
+                var spec = segments[i];
+                tasks[i] = Task.Run(async () =>
+                {
+                    try
+                    {
+                        (audio[idx], _) = await TtsClient.SynthesizeAsync(tts.Url, spec.Text, tts, spec.TtsEmotion, cts.Token);
+                    }
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex)
+                    {
+                        Log.Error("TTS 分段合成失败: " + (spec.Text.Length > 24 ? spec.Text[..24] + "…" : spec.Text), ex);
+                    }
+                }, cts.Token);
+            }
+            await Task.WhenAll(tasks);
+
+            var totalChars = segments.Sum(s => s.Text.Length);
+            for (var i = 0; i < segments.Count; i++)
+            {
+                if (seq != Volatile.Read(ref _speechSeq)) return;
+                await System.Windows.Application.Current.Dispatcher.InvokeAsync(() => ApplyEmotion(segments[i].Emotion));
+                var wav = audio[i];
+                if (wav != null && wav.Length > 0)
+                    PlaySegment(wav);
+                else
+                    await Task.Delay(SegmentDelayMs(_config.Character.BubbleDurationSec, segments[i].Text.Length, totalChars), cts.Token);
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Log.Error("Segmented TTS playback failed", ex);
+        }
+        finally
+        {
+            if (ReferenceEquals(_streamCts, cts)) _streamCts = null;
+        }
+    }
+
+    /// <summary>无 TTS：按文本比例分配 BubbleDurationSec，定时在段边界切换情绪。</summary>
+    private async Task PlaySegmentsProportionalAsync(int seq, IReadOnlyList<SpeechSegmentSpec> segments, double budgetSec)
+    {
+        var cts = new CancellationTokenSource();
+        if (seq != Volatile.Read(ref _speechSeq)) return;
+        _streamCts = cts;
+        try
+        {
+            var totalChars = segments.Sum(s => s.Text.Length);
+            for (var i = 0; i < segments.Count; i++)
+            {
+                if (seq != Volatile.Read(ref _speechSeq)) return;
+                await System.Windows.Application.Current.Dispatcher.InvokeAsync(() => ApplyEmotion(segments[i].Emotion));
+                await Task.Delay(SegmentDelayMs(budgetSec, segments[i].Text.Length, totalChars), cts.Token);
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            if (ReferenceEquals(_streamCts, cts)) _streamCts = null;
+        }
+    }
+
+    private static int SegmentDelayMs(double budgetSec, int charCount, int totalChars)
+    {
+        if (totalChars <= 0 || charCount <= 0) return (int)(budgetSec * 1000);
+        return Math.Max(250, (int)(budgetSec * 1000 * charCount / (double)totalChars));
+    }
+
     private void CancelStream()
     {
         var old = _streamCts;

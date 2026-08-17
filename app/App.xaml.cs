@@ -55,7 +55,7 @@ public partial class App : System.Windows.Application
         }
         if (!EnsureCharacterSelected()) return;
         Config.LoadActiveCharacter();
-        Log.Info("Active character: " + Config.Character.Current);
+        Log.Info("Active character: " + Config.EffectiveCharacterName);
         LlamaClient.ConfigureProxy(Config.Chat.Proxy);
 
         base.OnStartup(e);
@@ -196,10 +196,10 @@ public partial class App : System.Windows.Application
         }
 
         var current = _window?.GetCharacter() ?? "";
-        foreach (var name in _window?.GetCharacters() ?? new System.Collections.Generic.List<string>())
+        foreach (var folder in _window?.GetCharacters() ?? new System.Collections.Generic.List<string>())
         {
-            var item = new System.Windows.Forms.ToolStripMenuItem(name) { Checked = name == current };
-            item.Click += (_, _) => SwitchCharacter(name);
+            var item = new System.Windows.Forms.ToolStripMenuItem(Config.CharacterDisplayName(folder)) { Checked = folder == current };
+            item.Click += (_, _) => SwitchCharacter(folder);
             _trayMenu.Items.Add(item);
         }
         _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());

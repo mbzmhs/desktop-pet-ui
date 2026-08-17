@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -33,15 +34,24 @@ public partial class SettingsWindow : Window
         _statusTimer.Start();
     }
 
+        /// <summary>角色列表项：Folder 为文件夹名（唯一标识），Display 为 character.json 的 name 显示名。</summary>
+    private sealed class CharItem
+    {
+        public string Folder { get; init; } = "";
+        public string Display { get; init; } = "";
+        public override string ToString() => Display;
+    }
+
     private void ReloadList()
     {
         CharacterList.Items.Clear();
-        foreach (var name in _config.ListCharacters())
+        foreach (var folder in _config.ListCharacters())
         {
-            CharacterList.Items.Add(name);
+            CharacterList.Items.Add(new CharItem { Folder = folder, Display = _config.CharacterDisplayName(folder) });
         }
         var current = _config.Character.Current;
-        CharacterList.SelectedItem = current;
+        CharacterList.SelectedItem = CharacterList.Items.OfType<CharItem>()
+            .FirstOrDefault(x => string.Equals(x.Folder, current, StringComparison.OrdinalIgnoreCase));
         if (string.IsNullOrEmpty(current)) SetCurrentLabel("");
     }
 
@@ -75,12 +85,13 @@ public partial class SettingsWindow : Window
 
     private void OnCharacterSelected(object sender, SelectionChangedEventArgs e)
     {
-        if (CharacterList.SelectedItem is string name)
+        if (CharacterList.SelectedItem is CharItem item)
         {
+            var name = item.Folder;
             _selected = name;
             LoadCharPreview(name);
             var profile = CharacterProfile.Load(ProfilePath(name));
-            NameText.Text = name;
+            NameText.Text = _config.CharacterDisplayName(name);
             PromptBox.Text = profile.Llm.SystemPrompt ?? "";
             TemperatureBox.Text = profile.Llm.Temperature is double t ? t.ToString("0.###") : "0.7";
             MaxTokensBox.Text = profile.Llm.MaxTokens is int m ? m.ToString() : "";
@@ -120,9 +131,10 @@ public partial class SettingsWindow : Window
     private void SetCurrentLabel(string name)
     {
         var current = _config.Character.Current;
+        var currentDisplay = _config.EffectiveCharacterName;
         CurrentLabel.Text = string.IsNullOrEmpty(name)
-            ? (string.IsNullOrEmpty(current) ? "" : "当前角色：" + current)
-            : (name == current ? "（当前角色）" : "当前角色：" + current);
+            ? (string.IsNullOrEmpty(current) ? "" : "当前角色：" + currentDisplay)
+            : (name == current ? "（当前角色）" : "当前角色：" + currentDisplay);
     }
 
     private static int CharTagIndex(System.Windows.Controls.ComboBox box, string? tag)
@@ -237,7 +249,8 @@ public partial class SettingsWindow : Window
     private void OnSave(object sender, RoutedEventArgs e)
     {
         if (_selected == null) return;
-        var profile = new CharacterProfile { Name = _selected };
+        var profile = CharacterProfile.Load(ProfilePath(_selected));
+        if (string.IsNullOrWhiteSpace(profile.Name)) profile.Name = _selected;
         profile.Llm.SystemPrompt = PromptBox.Text ?? "";
 
         if (double.TryParse(TemperatureBox.Text?.Trim(), out var t))

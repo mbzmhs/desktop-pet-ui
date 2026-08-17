@@ -43,7 +43,7 @@ public partial class MemoryManagerWindow : Window
 
     private string CharacterName()
     {
-        var name = _config.Character.Current;
+        var name = _config.EffectiveCharacterName;
         return string.IsNullOrWhiteSpace(name) ? "宠物" : name;
     }
 

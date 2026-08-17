@@ -7,6 +7,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace DesktopPetUi.Core;
@@ -132,6 +133,7 @@ public static class TtsClient
         string text,
         ChatTtsConfig cfg,
         string? emotion = null,
+        bool stopPrev = false,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         var url = baseUrl.TrimEnd('/') + "/tts";
@@ -144,6 +146,7 @@ public static class TtsClient
             speed_factor = cfg.SpeedFactor,
             media_type = "wav",
             streaming = true,
+            stop_prev = stopPrev,
         };
         using var req = new HttpRequestMessage(HttpMethod.Post, url)
         {
@@ -314,5 +317,40 @@ public static class TtsClient
     {
         if (string.IsNullOrEmpty(s) || s.Length <= max) return s ?? "";
         return s[..max] + "…";
+    }
+
+    /// <summary>
+    /// 并行流式合成：立即发起请求并把收到的分句写入 Channel，由调用方按序消费。
+    /// ready 在收到第一段音频（或流结束）时完成，用于确保服务端已处理 stop_prev 后再发起后续并行请求，
+    /// 避免后续请求被自己带 stop_prev 的段杀掉。
+    /// </summary>
+    public static (IAsyncEnumerable<byte[]> Stream, Task Ready) StartStreamingBuffered(
+        string baseUrl, string text, ChatTtsConfig cfg, string? emotion, bool stopPrev, CancellationToken ct)
+    {
+        var ch = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleReader = true });
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = false;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var seg in SynthesizeStreamAsync(baseUrl, text, cfg, emotion, stopPrev, ct).WithCancellation(ct))
+                {
+                    if (!started) { started = true; ready.TrySetResult(); }
+                    await ch.Writer.WriteAsync(seg, ct);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                Log.Error("TTS 流式合成失败: " + (text.Length > 24 ? text[..24] + "…" : text), ex);
+            }
+            finally
+            {
+                if (!started) { started = true; ready.TrySetResult(); }
+                ch.Writer.TryComplete();
+            }
+        }, ct);
+        return (ch.Reader.ReadAllAsync(ct), ready.Task);
     }
 }

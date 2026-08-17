@@ -42,7 +42,7 @@ public partial class ChatWindow : Window
 
     public void ShowForInput()
     {
-        var name = App.Config.Character.Current;
+        var name = App.Config.EffectiveCharacterName;
         HintText.Text = string.IsNullOrEmpty(name) ? "和宠物说点什么…" : "和" + name + "说点什么…";
         Position();
         Show();
@@ -106,7 +106,7 @@ public partial class ChatWindow : Window
             Dispatcher.BeginInvoke(new Action(RefreshHistory));
             return;
         }
-        var name = App.Config.Character.Current;
+        var name = App.Config.EffectiveCharacterName;
         if (string.IsNullOrEmpty(name)) name = "宠物";
         var userBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x7E, 0xB8, 0xF5));
         var charBrush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xE0, 0xA0, 0xF0));

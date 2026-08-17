@@ -268,6 +268,20 @@ public sealed class AppConfig
             .ToList()!;
     }
 
+    /// <summary>角色显示名：优先 character.json 里的 name 字段，缺省回退到文件夹名。</summary>
+    public string CharacterDisplayName(string folderName)
+    {
+        if (string.IsNullOrWhiteSpace(folderName)) return "";
+        if (string.Equals(folderName, Character.Current, StringComparison.OrdinalIgnoreCase) &&
+            ActiveCharacter != null)
+            return string.IsNullOrWhiteSpace(ActiveCharacter.Name) ? folderName : ActiveCharacter.Name.Trim();
+        var p = CharacterProfile.Load(Path.Combine(CharacterDir, folderName, "character.json"));
+        return string.IsNullOrWhiteSpace(p.Name) ? folderName : p.Name.Trim();
+    }
+
+    /// <summary>当前生效角色的显示名（文件夹名为唯一标识，显示名仅用于界面展示）。</summary>
+    public string EffectiveCharacterName => CharacterDisplayName(Character.Current ?? "");
+
     public ChatConfig Chat { get; set; } = new();
     public CharacterConfig Character { get; set; } = new();
 
