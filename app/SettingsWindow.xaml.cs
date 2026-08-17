@@ -140,12 +140,24 @@ public partial class SettingsWindow : Window
     {
         CharScaleSlider.IsEnabled = CharScaleInheritCheck.IsChecked != true;
         CharScaleValueText.Text = CharScaleSlider.Value.ToString("0.00");
+        UpdateScalePreview();
     }
 
     private void OnCharScaleValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
         if (CharScaleValueText != null)
             CharScaleValueText.Text = CharScaleSlider.Value.ToString("0.00");
+        UpdateScalePreview();
+    }
+
+    /// <summary>把当前缩放滑条/继承选项实时应用到正在显示的立绘上，便于预览。仅当编辑的角色正是当前角色时生效。</summary>
+    private void UpdateScalePreview()
+    {
+        if (_selected == null ||
+            !string.Equals(_selected, _config.Character.Current, StringComparison.OrdinalIgnoreCase))
+            return;
+        var scale = CharScaleInheritCheck.IsChecked == true ? _config.Character.Scale : CharScaleSlider.Value;
+        App.PreviewCharacterScale(scale);
     }
 
     private void OnCharSpeedValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)

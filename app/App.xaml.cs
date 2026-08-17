@@ -26,6 +26,7 @@ public partial class App : System.Windows.Application
     private NotifyIcon? _tray;
     private System.Windows.Forms.ContextMenuStrip? _trayMenu;
     private DispatcherTimer? _proactiveTimer;
+    private bool _proactiveEnabled;
 
     public static AppConfig Config { get; private set; } = null!;
     public static PetWindow? PetWindow { get; private set; }
@@ -63,6 +64,7 @@ public partial class App : System.Windows.Application
         {
             _window = new PetWindow(Config);
             PetWindow = _window;
+            _window.SpeechStarted += OnSpeechStarted;
             _window.SpeechFinished += OnSpeechFinished;
             SetupTray(_window);
 
@@ -240,7 +242,11 @@ public partial class App : System.Windows.Application
         if (_settingsWindow == null)
         {
             _settingsWindow = new SettingsWindow(Config);
-            _settingsWindow.Closed += (_, _) => _settingsWindow = null;
+            _settingsWindow.Closed += (_, _) =>
+            {
+                _settingsWindow = null;
+                EndCharacterScalePreview();
+            };
         }
         _settingsWindow.Show();
         _settingsWindow.Activate();
@@ -272,6 +278,18 @@ public partial class App : System.Windows.Application
         app.ConfigureProactiveTimer();
         PetWindow?.ApplyWindowConfig();
         PetWindow?.RefreshIdleCycle();
+    }
+
+    public static void PreviewCharacterScale(double? scale)
+    {
+        if (Current is not App app || PetWindow == null) return;
+        app.Dispatcher.Invoke(() => PetWindow.PreviewScale(scale));
+    }
+
+    public static void EndCharacterScalePreview()
+    {
+        if (Current is not App app || PetWindow == null) return;
+        app.Dispatcher.Invoke(() => PetWindow.ClearScalePreview());
     }
 
     private string MemoryPath =>
@@ -335,7 +353,8 @@ public partial class App : System.Windows.Application
                 _proactiveTimer.Tick += OnProactiveTick;
             }
             _proactiveTimer.Stop();
-            if (Config.Chat.Enabled && (Config.Chat.Proactive || Config.Chat.ScreenAware) && Config.Chat.ProactiveIntervalSec > 0)
+            _proactiveEnabled = Config.Chat.Enabled && (Config.Chat.Proactive || Config.Chat.ScreenAware) && Config.Chat.ProactiveIntervalSec > 0;
+            if (_proactiveEnabled)
             {
                 _proactiveTimer.Interval = TimeSpan.FromSeconds(Config.Chat.ProactiveIntervalSec);
                 _proactiveTimer.Start();
@@ -363,11 +382,24 @@ public partial class App : System.Windows.Application
         }
     }
 
+    private void OnSpeechStarted()
+    {
+        try
+        {
+            if (_proactiveTimer == null || !_proactiveEnabled) return;
+            _proactiveTimer.Stop();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("OnSpeechStarted failed", ex);
+        }
+    }
+
     private void OnSpeechFinished()
     {
         try
         {
-            if (_proactiveTimer == null || !_proactiveTimer.IsEnabled) return;
+            if (_proactiveTimer == null || !_proactiveEnabled) return;
             _proactiveTimer.Stop();
             _proactiveTimer.Start();
             Log.Info("Proactive countdown restarted after speech");

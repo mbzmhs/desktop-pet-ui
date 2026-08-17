@@ -37,6 +37,7 @@ public partial class PetWindow : Window, ISpeakHost
     private double _dispScale;
     private double _dispLeft;
     private double _dispTop;
+    private double? _previewScale;
     private int _bodyMinX = int.MaxValue;
     private int _bodyMaxX = -1;
     private int _bodyMinY = int.MaxValue;
@@ -388,7 +389,7 @@ public partial class PetWindow : Window, ISpeakHost
         var availH = Math.Max(1, winH - reserved);
         var fit = Math.Min(winW / _imgPxW, availH / _imgPxH);
         if (fit <= 0 || !double.IsFinite(fit)) fit = 1;
-        fit *= _config.EffectiveScale;
+        fit *= _previewScale ?? _config.EffectiveScale;
         _dispScale = fit;
         var dispW = _imgPxW * fit;
         var dispH = _imgPxH * fit;
@@ -456,7 +457,11 @@ public partial class PetWindow : Window, ISpeakHost
         if (_bubbleTimer == null)
         {
             _bubbleTimer = new DispatcherTimer();
-            _bubbleTimer.Tick += (_, _) => Bubble.Visibility = Visibility.Collapsed;
+            _bubbleTimer.Tick += (_, _) =>
+            {
+                Bubble.Visibility = Visibility.Collapsed;
+                SpeechFinished?.Invoke();
+            };
         }
         _bubbleTimer.Stop();
         _bubbleTimer.Interval = TimeSpan.FromSeconds(sec);
@@ -538,6 +543,20 @@ public partial class PetWindow : Window, ISpeakHost
         LayoutImage();
     }
 
+    /// <summary>实时预览立绘缩放（设置窗口中拖动滑条时调用）。null 表示使用当前配置的生效缩放。</summary>
+    public void PreviewScale(double? scale)
+    {
+        _previewScale = scale;
+        LayoutImage();
+    }
+
+    /// <summary>清除缩放预览，恢复使用配置文件里的生效缩放。</summary>
+    public void ClearScalePreview()
+    {
+        _previewScale = null;
+        LayoutImage();
+    }
+
     private void SetCursorState(bool over)
     {
         var target = over ? System.Windows.Input.Cursors.Hand : System.Windows.Input.Cursors.Arrow;
@@ -592,6 +611,7 @@ public partial class PetWindow : Window, ISpeakHost
         _config.LoadActiveCharacter();
         _config.Save();
         _currentImagePath = null;
+        _previewScale = null;
         Bubble.Visibility = Visibility.Collapsed;
         StopIdleReset();
         StopIdleCycle();
@@ -685,7 +705,10 @@ public partial class PetWindow : Window, ISpeakHost
 
     // ---------------- speak ----------------
 
-    /// <summary>一段语音完全播放结束后触发（用于主动搭话计时等）。</summary>
+    /// <summary>角色开始说话（气泡显示）时触发，用于主动搭话计时清零。</summary>
+    public Action? SpeechStarted { get; set; }
+
+    /// <summary>当前话说完且气泡消失后触发，用于主动搭话计时重新开始。</summary>
     public Action? SpeechFinished { get; set; }
 
     private int _speechSeq;
@@ -700,14 +723,14 @@ public partial class PetWindow : Window, ISpeakHost
         {
             ApplyEmotion(imgEmotion);
             if (!string.IsNullOrWhiteSpace(text)) ShowBubble(text);
+            SpeechStarted?.Invoke();
         });
         if (audio != null && audio.Length > 0)
         {
-            ScheduleSpeechVisuals(TtsClient.EstimateWavDurationSec(audio));
             _ = Task.Run(() =>
             {
                 PlaySegment(audio);
-                NotifySpeechFinished(seq, false);
+                NotifySpeechFinished(seq, true);
             });
         }
         else
@@ -727,6 +750,7 @@ public partial class PetWindow : Window, ISpeakHost
         {
             ApplyEmotion(imgEmotion);
             if (!string.IsNullOrWhiteSpace(text)) ShowBubble(text);
+            SpeechStarted?.Invoke();
         });
         _ = PlayStreamAsync(audioSegments, seq);
     }
@@ -805,8 +829,11 @@ public partial class PetWindow : Window, ISpeakHost
         {
             Dispatcher.BeginInvoke(() =>
             {
-                if (endVisuals) EndSpeechVisuals();
-                SpeechFinished?.Invoke();
+                if (endVisuals)
+                {
+                    EndSpeechVisuals();
+                    SpeechFinished?.Invoke();
+                }
             });
         }
         catch { }

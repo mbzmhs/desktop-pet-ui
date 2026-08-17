@@ -83,8 +83,11 @@ public static class TtsClient
             }
         }
         catch { }
-        _voicesBase = baseUrl;
-        _cachedVoices = list;
+        if (list.Count > 0)
+        {
+            _voicesBase = baseUrl;
+            _cachedVoices = list;
+        }
         return list;
     }
 
