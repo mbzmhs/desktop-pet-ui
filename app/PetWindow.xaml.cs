@@ -457,11 +457,7 @@ public partial class PetWindow : Window, ISpeakHost
         if (_bubbleTimer == null)
         {
             _bubbleTimer = new DispatcherTimer();
-            _bubbleTimer.Tick += (_, _) =>
-            {
-                Bubble.Visibility = Visibility.Collapsed;
-                SpeechFinished?.Invoke();
-            };
+            _bubbleTimer.Tick += (_, _) => EndSpeechVisuals();
         }
         _bubbleTimer.Stop();
         _bubbleTimer.Interval = TimeSpan.FromSeconds(sec);
@@ -481,13 +477,14 @@ public partial class PetWindow : Window, ISpeakHost
         _idleResetTimer.Start();
     }
 
-    /// <summary>语音（流式）播完后立即收起气泡、恢复空闲表情。</summary>
+    /// <summary>语音（流式）播完、气泡定时到点或切换角色时收起气泡、恢复空闲表情，并触发 SpeechFinished 以重启主动搭话计时。</summary>
     private void EndSpeechVisuals()
     {
         _bubbleTimer?.Stop();
         Bubble.Visibility = Visibility.Collapsed;
         StopIdleReset();
         ShowIdle();
+        SpeechFinished?.Invoke();
     }
 
     private void StopIdleReset()
@@ -612,11 +609,7 @@ public partial class PetWindow : Window, ISpeakHost
         _config.Save();
         _currentImagePath = null;
         _previewScale = null;
-        Bubble.Visibility = Visibility.Collapsed;
-        StopIdleReset();
-        StopIdleCycle();
-        ApplyEmotion(null);
-        StartIdleCycle();
+        EndSpeechVisuals();
     }
 
     // ---------------- click-through ----------------
@@ -995,7 +988,6 @@ public partial class PetWindow : Window, ISpeakHost
                 if (endVisuals)
                 {
                     EndSpeechVisuals();
-                    SpeechFinished?.Invoke();
                 }
             });
         }
