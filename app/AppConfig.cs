@@ -15,11 +15,6 @@ public sealed class ChatLlamaConfig
     public string Model { get; set; } = "local";
     public double Temperature { get; set; } = 0.7;
     public int MaxTokens { get; set; } = 512;
-    public string SystemPrompt { get; set; } =
-        "你是一个住在用户桌面上的陪伴型聊天助手，温柔体贴，像朋友一样关心用户，让人感到安心。" +
-        "请始终使用简体中文回复，语气自然亲切，可以活泼、调侃或偶尔撒娇，但不要油腻。" +
-        "回复要简短（2句以内），像日常聊天一样自然，不要长篇大论，不要重复用户的话。" +
-        "回复结尾请附上1个情感标签，具体可选标签见本系统提示末尾的【情感标签】一节。";
 }
 
 public sealed class ChatTtsConfig
@@ -174,25 +169,32 @@ public sealed class AppConfig
     [JsonIgnore]
     public CharacterProfile? ActiveCharacter { get; set; }
 
+    [JsonIgnore]
     public string CharacterDir => Path.Combine(AppContext.BaseDirectory, Character.Dir);
 
+    [JsonIgnore]
     public string EffectiveSystemPrompt =>
         !string.IsNullOrWhiteSpace(ActiveCharacter?.Llm?.SystemPrompt)
             ? ActiveCharacter!.Llm.SystemPrompt
-            : Chat.Llama.SystemPrompt;
+            : "";
 
+    [JsonIgnore]
     public double EffectiveTemperature =>
         ActiveCharacter?.Llm?.Temperature is double t ? t : Chat.Llama.Temperature;
 
+    [JsonIgnore]
     public int EffectiveMaxTokens =>
         ActiveCharacter?.Llm?.MaxTokens is int m ? m : Chat.Llama.MaxTokens;
 
+    [JsonIgnore]
     public double EffectiveProactiveTemperature =>
         ActiveCharacter?.ProactiveTemperature is double t ? t : EffectiveTemperature;
 
+    [JsonIgnore]
     public double EffectiveScale =>
         ActiveCharacter?.Scale is double s && s > 0 ? s : Character.Scale;
 
+    [JsonIgnore]
     public string EffectiveUserAddress
     {
         get
@@ -223,6 +225,7 @@ public sealed class AppConfig
         };
     }
 
+    [JsonIgnore]
     public string EffectiveTextLang
     {
         get

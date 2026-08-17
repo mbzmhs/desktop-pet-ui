@@ -168,10 +168,10 @@ public sealed class ChatPipeline : IDisposable
         var emotions = CharacterEmotions() ?? ChatEmotion.Emotions;
         var list = string.Join(" ", emotions.Select(x => "[" + x + "]"));
         return lang == "ja"
-            ? "【感情タグ】返答の途中に感情タグを挿入して感情を切り替えられます。例：「[angry]ひどいよ！[happy]冗談だよ」。タグは読み上げられず、会話途中の立ち絵の感情切り替えにのみ使われます。文末にタグは付けないでください（無効）。1回の返答につき1〜3個で十分です。使えるタグ：" + list
+            ? "【感情タグ】返答は必ず感情タグで始めてください（例：「[happy]こんにちは！」）。タグは読み上げられず、立ち絵の感情切り替えにのみ使われます。会話途中で感情を変える場合も、その位置にタグを挿入してください。タグを連続して並べる場合は先頭の1つだけが有効です。文末にはタグを付けないでください（無効）。1回の返答につき1〜3個で十分です。使えるタグ：" + list
             : lang == "en"
-                ? "【Emotion tags】Insert an emotion tag anywhere in your reply to switch emotion mid-speech, e.g. '[angry]How could you! [happy]Just kidding.'. Tags are not read aloud and only switch the character's expression mid-speech. Do not append a tag at the end (ignored). 1-3 tags per reply is enough. Available tags: " + list
-                : "【情感标签】你可以在回复中途任意位置插入情感标签来切换情绪，例如「[angry]你怎么这样！[happy]开玩笑的啦」。标签不会被朗读，只在说话中途切换立绘情绪；结尾不要加标签（无效），每次回复插入 1~3 个即可，不要每句都标。只能从以下可选标签中选择：" + list;
+                ? "【Emotion tags】Your reply MUST start with an emotion tag (e.g. '[happy]Hello!'). Tags are not read aloud and only switch the character's expression mid-speech. To change emotion mid-speech, insert a tag at that point. If tags are placed adjacent to each other, only the first one is used. Do not append a tag at the end (ignored). 1-3 tags per reply is enough. Available tags: " + list
+                : "【情感标签】回复必须以一个情感标签开头（例如「[happy]你好呀！」）。标签不会被朗读，只在说话中途切换立绘情绪。中途要切换情绪时，在切换位置插入标签即可。标签并列连写时只保留第一个。结尾不要加标签（无效），每次回复 1~3 个即可。只能从以下可选标签中选择：" + list;
     }
 
     private async Task EnsureEmotionsAsync()
@@ -362,10 +362,10 @@ public sealed class ChatPipeline : IDisposable
     {
         var lang = _config.EffectiveTextLang;
         if (lang == "ja")
-            return "今はあなたが話しかける番です。ユーザーはしばらく話していません。過去の会話（摘要）の続きではなく、新しい話題（今日の出来事・趣味・相手の近況など）を1つ話しかけてください。1文以内、同じフレーズや同じ話題の繰り返しは避けてください。最後に感情タグを付けてください。";
+            return "今はあなたが話しかける番です。ユーザーはしばらく話していません。過去の会話（摘要）の続きではなく、新しい話題（今日の出来事・趣味・相手の近況など）を1つ話しかけてください。1文以内、同じフレーズや同じ話題の繰り返しは避けてください。文の先頭に感情タグを付けてください。";
         if (lang == "en")
-            return "It's your turn to start a conversation. The user has been silent for a while. Don't continue the past conversation (summary); instead bring up a new topic (today's events, hobbies, how the user is doing, etc.). Say it in at most one sentence, avoid repeating the same phrases or topics. End with one emotion tag.";
-        return "现在轮到你主动开口了。用户已经沉默了一会儿。不要接着之前的话题（摘要）继续，而是挑一个新话题（今天发生的事、兴趣爱好、对方近况等）主动说一句。不超过一句话，避免重复说过的话或话题。结尾带上情感标签。";
+            return "It's your turn to start a conversation. The user has been silent for a while. Don't continue the past conversation (summary); instead bring up a new topic (today's events, hobbies, how the user is doing, etc.). Say it in at most one sentence, avoid repeating the same phrases or topics. Start with one emotion tag.";
+        return "现在轮到你主动开口了。用户已经沉默了一会儿。不要接着之前的话题（摘要）继续，而是挑一个新话题（今天发生的事、兴趣爱好、对方近况等）主动说一句。不超过一句话，避免重复说过的话或话题。开头带上情感标签。";
     }
 
     private string ProactiveRepeatInstruction()
