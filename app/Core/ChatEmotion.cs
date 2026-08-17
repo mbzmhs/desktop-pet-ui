@@ -17,22 +17,22 @@ public static class ChatEmotion
     /// <summary>
     /// 从 LLM 回复中解析情感标签。返回 (情感, 去掉标签后的正文)。
     /// 支持任意 [xxx] 标签（包括 tts-server 自定义情感），由调用方根据可用列表校验。
-    /// 多个标签并列（之间无正文）时只保留第一个，其余剥离；正文中的所有标签一律去掉、不朗读。
+    /// 多个标签并列（之间无正文）时只保留最后一个，其余剥离；正文中的所有标签一律去掉、不朗读。
     /// </summary>
     public static (string? Emotion, string Text) Parse(string reply)
     {
         if (string.IsNullOrWhiteSpace(reply)) return (null, reply ?? "");
         var matches = Regex.Matches(reply, @"\[([A-Za-z0-9_\-]+)\]");
         if (matches.Count == 0) return (null, NormalizeSpaces(reply));
-        var first = matches[0].Groups[1].Value;
+        var last = matches[matches.Count - 1].Groups[1].Value;
         var text = Regex.Replace(reply, @"\[[A-Za-z0-9_\-]+\]", "");
-        return (first, NormalizeSpaces(text));
+        return (last, NormalizeSpaces(text));
     }
 
     /// <summary>
     /// 解析回复中的多个情感标签，用于说话中途切换情绪。
     /// 约定：标签仅作中途切换用，不代表整段情绪、不做结尾标注；标签一律从正文剥离、不朗读；
-    /// 标签并列连写（之间无正文）时只保留第一个。返回 (情感, 文本) 分段：开头无标签的文本用 null
+    /// 标签并列连写（之间无正文）时只保留最后一个。返回 (情感, 文本) 分段：开头无标签的文本用 null
     /// （默认情绪）；标签间空文本段被跳过；结尾标签后无文字则不起切换作用。相邻同情感段的合并由调用方按解析后的情感处理。
     /// </summary>
     public static List<(string? Emotion, string Text)> ParseSegments(string reply)
@@ -50,15 +50,8 @@ public static class ChatEmotion
         foreach (Match m in matches)
         {
             var text = reply[pos..m.Index].Trim();
-            if (text.Length > 0)
-            {
-                segments.Add((current, NormalizeSpaces(text)));
-                current = m.Groups[1].Value;
-            }
-            else if (current == null)
-            {
-                current = m.Groups[1].Value;
-            }
+            if (text.Length > 0) segments.Add((current, NormalizeSpaces(text)));
+            current = m.Groups[1].Value;
             pos = m.Index + m.Length;
         }
         var tail = reply[pos..].Trim();

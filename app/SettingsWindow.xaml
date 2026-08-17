@@ -349,12 +349,12 @@
                             <ColumnDefinition Width="*"/>
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0">
-                            <TextBlock Text="对话上下文字数阈值（字）" Foreground="#444" Margin="0,0,0,4"/>
+                            <TextBlock Text="对话历史总字数上限（字）" Foreground="#444" Margin="0,0,0,4"/>
                             <TextBox x:Name="ContextMaxCharsBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
                         </StackPanel>
                         <StackPanel Grid.Column="2">
                             <TextBlock Text="0 表示不启用字数压缩" Foreground="#999" Margin="0,0,0,4"/>
-                            <TextBlock Text="超过条数上限或字数阈值即压缩" Foreground="#999"/>
+                            <TextBlock Text="超过条数上限或字数上限即压缩；摘要输出量约为此值的 1/8" Foreground="#999"/>
                         </StackPanel>
                     </Grid>
 

@@ -169,10 +169,10 @@ public sealed class ChatPipeline : IDisposable
         var emotions = CharacterEmotions() ?? ChatEmotion.Emotions;
         var list = string.Join(" ", emotions.Select(x => "[" + x + "]"));
         return lang == "ja"
-            ? "【感情タグ】返答は必ず感情タグで始めてください（例：「[happy]こんにちは！」）。タグは読み上げられず、立ち絵の感情切り替えにのみ使われます。会話途中で感情を変える場合も、その位置にタグを挿入してください。タグを連続して並べる場合は先頭の1つだけが有効です。文末にはタグを付けないでください（無効）。1回の返答につき1〜3個で十分です。使えるタグ：" + list
+            ? "【感情タグ】返答は必ず感情タグで始めてください（例：「[happy]こんにちは！」）。タグは読み上げられず、立ち絵の感情切り替えにのみ使われます。会話途中で感情を変える場合も、その位置にタグを挿入してください。文末にはタグを付けないでください（無効）。1回の返答につき1〜3個で十分です。使えるタグ：" + list
             : lang == "en"
-                ? "【Emotion tags】Your reply MUST start with an emotion tag (e.g. '[happy]Hello!'). Tags are not read aloud and only switch the character's expression mid-speech. To change emotion mid-speech, insert a tag at that point. If tags are placed adjacent to each other, only the first one is used. Do not append a tag at the end (ignored). 1-3 tags per reply is enough. Available tags: " + list
-                : "【情感标签】回复必须以一个情感标签开头（例如「[happy]你好呀！」）。标签不会被朗读，只在说话中途切换立绘情绪。中途要切换情绪时，在切换位置插入标签即可。标签并列连写时只保留第一个。结尾不要加标签（无效），每次回复 1~3 个即可。只能从以下可选标签中选择：" + list;
+                ? "【Emotion tags】Your reply MUST start with an emotion tag (e.g. '[happy]Hello!'). Tags are not read aloud and only switch the character's expression mid-speech. To change emotion mid-speech, insert a tag at that point. Do not append a tag at the end (ignored). 1-3 tags per reply is enough. Available tags: " + list
+                : "【情感标签】回复必须以一个情感标签开头（例如「[happy]你好呀！」）。标签不会被朗读，只在说话中途切换立绘情绪。中途要切换情绪时，在切换位置插入标签即可。结尾不要加标签（无效），每次回复 1~3 个即可。只能从以下可选标签中选择：" + list;
     }
 
     private async Task EnsureEmotionsAsync()
@@ -626,7 +626,7 @@ public sealed class ChatPipeline : IDisposable
             }
             var ep = _config.EffectiveLlm();
             var summary = await LlamaClient.CompleteAsync(
-                ep.Url, messages, ep.Model, 0.3, 256, ep.ApiKey, ep.ExtraParams);
+                ep.Url, messages, ep.Model, 0.3, SummaryMaxTokens(), ep.ApiKey, ep.ExtraParams);
             return string.IsNullOrWhiteSpace(summary) ? (prevSummary ?? "") : summary.Trim();
         }
         catch (Exception ex)
@@ -634,6 +634,14 @@ public sealed class ChatPipeline : IDisposable
             Log.Error("CompressAsync failed", ex);
             return prevSummary ?? "";
         }
+    }
+
+    /// <summary>摘要输出的 token 上限：按「对话历史总字数上限」的 1/8 计算（约 4000 字 → 500 token），带上下限兜底。</summary>
+    private int SummaryMaxTokens()
+    {
+        var budget = _config.Chat.ContextMaxChars;
+        if (budget <= 0) budget = 4000;
+        return Math.Clamp(budget / 8, 256, 2048);
     }
 
     public void ClearHistory()
