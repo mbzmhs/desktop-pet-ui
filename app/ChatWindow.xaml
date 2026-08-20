@@ -69,6 +69,7 @@
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBox x:Name="InputBox"
                          Background="#2A2D33"
@@ -84,7 +85,11 @@
                          MaxHeight="96"
                          VerticalScrollBarVisibility="Auto"
                          KeyDown="OnInputKeyDown"/>
-                <Button x:Name="SendBtn" Grid.Column="1" Content="发送" Click="OnSendClick"
+                <Button x:Name="StopBtn" Grid.Column="1" Content="停止" Click="OnStopClick"
+                        Background="#B94A4A" Foreground="White" BorderThickness="0"
+                        FontSize="14" Padding="12,5" Margin="8,0,0,0" Cursor="Hand"
+                        Visibility="Collapsed"/>
+                <Button x:Name="SendBtn" Grid.Column="2" Content="发送" Click="OnSendClick"
                         Background="#3D7EBF" Foreground="White" BorderThickness="0"
                         FontSize="14" Padding="14,5" Margin="8,0,0,0" Cursor="Hand"/>
             </Grid>

@@ -732,8 +732,8 @@ public static class AgentTools
         return list;
     }
 
-    /// <summary>执行工具，返回回填给模型的结果（错误也以文本形式返回，让模型自行调整）。host 供 ask_user 使用。</summary>
-    public static async Task<ToolResult> ExecuteAsync(string name, JsonObject args, AppConfig cfg, ISpeakHost? host = null)
+    /// <summary>执行工具，返回回填给模型的结果（错误也以文本形式返回，让模型自行调整）。host 供 ask_user 使用；ct 取消时 run_powershell 立即杀进程。</summary>
+    public static async Task<ToolResult> ExecuteAsync(string name, JsonObject args, AppConfig cfg, ISpeakHost? host = null, CancellationToken ct = default)
     {
         var agent = cfg.Chat.Agent;
         try
@@ -754,7 +754,7 @@ public static class AgentTools
                         arg(args, "pattern"), OrDefault(arg(args, "root_dir"), ""), args["max_results"]?.GetValue<int>() ?? 50, cfg));
                 case "web_fetch": return await WebFetch(arg(args, "url"));
                 case "run_powershell":
-                    return await Task.Run(() => RunPowerShellSync(arg(args, "command"), agent.PsTimeoutSec, cfg));
+                    return await Task.Run(() => RunPowerShellSync(arg(args, "command"), agent.PsTimeoutSec, cfg, ct), ct);
                 case "start_powershell": return JobManager.Start(arg(args, "command"), cfg);
                 case "check_job": return JobManager.Check(arg(args, "job_id"));
                 case "todo": return TodoAction(arg(args, "action"), args, cfg);
@@ -1279,17 +1279,18 @@ public static class AgentTools
         return string.Join("\n", lines);
     }
 
-    private static string RunPowerShellSync(string command, double timeoutSec, AppConfig cfg)
+    private static string RunPowerShellSync(string command, double timeoutSec, AppConfig cfg, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(command)) return "错误：command 不能为空";
-        var (code, output, timedOut) = PowerShellRunner.Run(command, Math.Clamp(timeoutSec, 5, 300), ResolveWorkDir(cfg));
-        return FormatPsResult(code, output, timedOut);
+        var (code, output, timedOut, cancelled) = PowerShellRunner.Run(command, Math.Clamp(timeoutSec, 5, 300), ResolveWorkDir(cfg), ct);
+        return FormatPsResult(code, output, timedOut, cancelled);
     }
 
-    private static string FormatPsResult(int? code, string output, bool timedOut)
+    private static string FormatPsResult(int? code, string output, bool timedOut, bool cancelled)
     {
         var sb = new StringBuilder();
-        if (timedOut) sb.AppendLine("（超时被终止）");
+        if (cancelled) sb.AppendLine("（用户手动停止，进程已终止）");
+        else if (timedOut) sb.AppendLine("（超时被终止）");
         else sb.AppendLine("退出码 " + code);
         var outText = Truncate(output.Trim(), MaxResultChars);
         return sb.Append(outText.Length > 0 ? outText : "（无输出）").ToString();
@@ -1322,8 +1323,9 @@ public static class AgentTools
 /// <summary>PowerShell 进程运行器（同步等待）。</summary>
 public static class PowerShellRunner
 {
-    public static (int? Code, string Output, bool TimedOut) Run(string command, double timeoutSec, string workDir)
+    public static (int? Code, string Output, bool TimedOut, bool Cancelled) Run(string command, double timeoutSec, string workDir, CancellationToken ct = default)
     {
+        if (ct.IsCancellationRequested) return (-1, "（用户手动停止，未执行）", false, true);
         var psi = new ProcessStartInfo
         {
             FileName = "powershell.exe",
@@ -1337,7 +1339,9 @@ public static class PowerShellRunner
         var sbOut = new StringBuilder();
         var sbErr = new StringBuilder();
         using var proc = Process.Start(psi);
-        if (proc == null) return (-1, "错误：无法启动 powershell.exe", false);
+        if (proc == null) return (-1, "错误：无法启动 powershell.exe", false, false);
+        // 手动停止 → 立即杀掉整棵进程树（不等超时）
+        using var cancelReg = ct.Register(() => { try { proc.Kill(entireProcessTree: true); } catch { } });
         var doneOut = new TaskCompletionSource();
         var doneErr = new TaskCompletionSource();
         proc.OutputDataReceived += (_, e) => { if (e.Data != null) lock (sbOut) sbOut.AppendLine(e.Data); else doneOut.TrySetResult(); };
@@ -1363,7 +1367,7 @@ public static class PowerShellRunner
         var output = string.IsNullOrWhiteSpace(e) ? o : (string.IsNullOrWhiteSpace(o) ? e : o + "\n[stderr]\n" + e);
         int? code = null;
         try { if (!timedOut && proc.HasExited) code = proc.ExitCode; } catch { }
-        return (code, output, timedOut);
+        return (code, output, timedOut, ct.IsCancellationRequested);
     }
 
     /// <summary>把命令编码为 -EncodedCommand 参数（Base64 UTF-16LE），彻底绕开命令行引号/反斜杠转义问题。

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Text.Json.Nodes;
 
@@ -64,8 +65,8 @@ public sealed class AgentRunner
         return null;
     }
 
-    /// <summary>执行 agent 循环，返回最终回答文本（不含工具块）。</summary>
-    public async Task<string> RunAsync(IReadOnlyList<ChatMessage> seedMessages, ISpeakHost host)
+    /// <summary>执行 agent 循环，返回最终回答文本（不含工具块）。ct 取消时抛 OperationCanceledException。</summary>
+    public async Task<string> RunAsync(IReadOnlyList<ChatMessage> seedMessages, ISpeakHost host, CancellationToken ct = default)
     {
         // 0（或负数）= 不限步数，与 opencode 一致：循环直到模型不再调工具；正数仍设一个宽松上限防误填天文数字
         var maxSteps = _config.Chat.Agent.MaxSteps <= 0 ? int.MaxValue : Math.Clamp(_config.Chat.Agent.MaxSteps, 1, 500);
@@ -74,7 +75,8 @@ public sealed class AgentRunner
 
         for (var step = 1; step <= maxSteps; step++)
         {
-            var reply = await CompleteAsync(messages);
+            ct.ThrowIfCancellationRequested(); // 步间停止
+            var reply = await CompleteAsync(messages, ct);
             if (string.IsNullOrWhiteSpace(reply)) return "";
 
             string? feedback = null; // 非 null 时回填给模型继续循环
@@ -139,7 +141,8 @@ public sealed class AgentRunner
 
                     if (feedback == null)
                     {
-                        var result = await AgentTools.ExecuteAsync(call.Name, call.Args, _config, host);
+                        ct.ThrowIfCancellationRequested(); // 等确认期间用户点了停止 → 不执行工具
+                        var result = await AgentTools.ExecuteAsync(call.Name, call.Args, _config, host, ct);
                         Log.Info("Agent result [" + call.Name + "]: " + EscapeForLog(Truncate(result.Text, 500)));
                         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 工具结果: " + Truncate(result.Text, 500).Replace("\n", " ⏎ "));
                         feedback = (trustNote != null ? "[note] " + trustNote + "\n" : "") + "[result] " + Truncate(result.Text, 2000);
@@ -169,7 +172,7 @@ public sealed class AgentRunner
         // 步数用尽：强制收束，不再允许工具调用
         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 达到最大步数，强制收束");
         messages.Add(new ChatMessage { Role = "user", Content = "[system] 已达到最大工具调用次数。不要再输出 [tool] 块，直接基于已有结果给用户最终回答。" });
-        var final = await CompleteAsync(messages);
+        var final = await CompleteAsync(messages, ct);
         return StripToolBlocks(final ?? "");
     }
 
@@ -227,7 +230,7 @@ public sealed class AgentRunner
         }
     }
 
-    private async Task<string> CompleteAsync(List<ChatMessage> messages)
+    private async Task<string> CompleteAsync(List<ChatMessage> messages, CancellationToken ct = default)
     {
         var ep = _config.EffectiveLlm();
         // 硬护栏：循环中工具往返不断累积，每次请求前都按模型实际上限裁剪（只改工作列表，长期历史不动）
@@ -238,7 +241,7 @@ public sealed class AgentRunner
         var result = await LlamaClient.CompleteAsync(
             ep.Url, messages, ep.Model,
             _config.EffectiveTemperature, _config.EffectiveMaxTokens,
-            ep.ApiKey, ep.ExtraParams);
+            ep.ApiKey, ep.ExtraParams, ct);
         // 每步都带 system+完整历史：上报真实 usage（上下文占用显示与 token/字比率校准）
         OnUsage?.Invoke(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0));
         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] ← agent llama 回复:\n" + result.Text);
@@ -248,7 +251,7 @@ public sealed class AgentRunner
     private const string SingleLineFormat = "[tool]{\"name\":\"工具名\",\"args\":{...}}[/tool]";
 
     /// <summary>兜底：若强制收束后模型仍输出工具块，剥掉再返回。</summary>
-    private static string StripToolBlocks(string s)
+    public static string StripToolBlocks(string s)
     {
         var result = s;
         while (true)

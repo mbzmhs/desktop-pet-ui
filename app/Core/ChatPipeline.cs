@@ -54,6 +54,11 @@ public sealed class ChatPipeline : IDisposable
     /// <summary>历史压缩进行中变化（true=开始压缩，false=结束；后台线程触发）。压缩期间聊天窗应提示并锁定输入。</summary>
     public event Action<bool>? CompressingChanged;
     public bool IsRunning { get; private set; }
+    private CancellationTokenSource? _runCts;
+
+    /// <summary>手动停止当前运行：立即中止进行中的 LLM 请求/工具；用户发起的轮次会在历史留中断标记。不视为错误。</summary>
+    public void Stop() => _runCts?.Cancel();
+
     /// <summary>是否正在压缩历史（摘要 LLM 调用中）。</summary>
     public bool IsCompressing { get; private set; }
 
@@ -182,6 +187,11 @@ public sealed class ChatPipeline : IDisposable
             if (!string.IsNullOrWhiteSpace(pathLine)) parts.Add(pathLine);
             parts.Add(AgentToolLine());
         }
+        else
+        {
+            // 历史里可能有 agent 开启时的 [tool]/[result] 示例，模型会模仿——明确声明当前无工具可用
+            parts.Add("AGENT MODE IS DISABLED: you have NO tools in this session, even if earlier messages show [tool] examples. If the user asks for computer operations (run commands, create files, browse...), reply in plain text explaining that the Agent feature must be enabled in settings first — NEVER output any [tool] block.");
+        }
         var emoLine = AvailableEmotionLine();
         if (!string.IsNullOrWhiteSpace(emoLine))
             parts.Add(emoLine);
@@ -203,7 +213,8 @@ public sealed class ChatPipeline : IDisposable
     /// <summary>Agent 工具协议（仅 agent 开启时注入）。英文书写以最大化指令遵循；回复语言由 LANGUAGE 段控制。</summary>
     private static string AgentToolLine()
     {
-        return "[AGENT MODE] You can operate this computer on the user's behalf via tools.\n" +
+        return "[AGENT MODE] You can operate this computer on the user's behalf via tools. " +
+               "CURRENT STATE: agent mode is ENABLED right now — if any earlier message says tools/the Agent are disabled or unavailable, that is stale (the setting was off at the time); ignore it and call tools normally.\n" +
                "PROTOCOL (follow EXACTLY):\n" +
                 "- To call a tool, put ONE line in your reply: [tool]{\"name\":\"tool_name\",\"risk\":\"low|medium|high\",\"args\":{...}}[/tool] — at most ONE [tool] line per reply. You may add one short in-character sentence about what you are doing, then WAIT for the [result] message before continuing.\n" +
                 "- A reply WITHOUT a [tool] line ENDS the task. Therefore: if you still need to do anything (search, read, run, create...), this reply MUST contain the [tool] line — NEVER just say \"let me look/try/check\" and stop without calling the tool. Reserve tool-free replies for final answers or when no action is needed.\n" +
@@ -372,20 +383,39 @@ public sealed class ChatPipeline : IDisposable
     {
         await _gate.WaitAsync();
         IsRunning = true;
+        var cts = new CancellationTokenSource();
+        _runCts = cts;
         try
         {
             lock (_histLock) _history.Add(new ChatMessage { Role = "user", Content = userText });
             NotifyHistory();
             Status?.Invoke("思考中…");
 
-            await MaybeCompressAsync(); // 请求前压缩（对齐 opencode），不占 TTS 时间；滞回保证不会每轮都压
+            await MaybeCompressAsync(cts.Token); // 请求前压缩（对齐 opencode），不占 TTS 时间；滞回保证不会每轮都压
             NotifyHistory();
             var messages = await BuildMessagesAsync();
             string rawReply;
             if (_config.Chat.Agent.Enabled)
-                rawReply = await _agent.RunAsync(messages, host); // 工具循环（中间往返经 OnMessage 进长期历史）
+                rawReply = await _agent.RunAsync(messages, host, cts.Token); // 工具循环（中间往返经 OnMessage 进长期历史）
             else
-                rawReply = await CompleteAsync(messages);
+            {
+                rawReply = await CompleteAsync(messages, null, cts.Token);
+                // agent 关闭时模型若模仿历史输出 [tool]：回灌"工具不可用"纠正并让它改用文字回答（最多 2 次），往返持久化防止复发
+                const string noToolFeedback = "[error] Agent 功能未开启，无法调用工具。请直接用文字回答：可以说明需要做什么、或提醒用户在设置里开启 Agent 后再试。不要再输出 [tool] 块。";
+                for (var guard = 0; guard < 2 && rawReply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0; guard++)
+                {
+                    lock (_histLock)
+                    {
+                        _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
+                        _history.Add(new ChatMessage { Role = "user", Content = noToolFeedback });
+                    }
+                    messages.Add(new ChatMessage { Role = "assistant", Content = rawReply });
+                    messages.Add(new ChatMessage { Role = "user", Content = noToolFeedback });
+                    rawReply = await CompleteAsync(messages, null, cts.Token);
+                }
+                if (rawReply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
+                    rawReply = AgentRunner.StripToolBlocks(rawReply); // 仍不合规：剥离工具块只留文字部分
+            }
             lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             NotifyHistory();
 
@@ -394,6 +424,14 @@ public sealed class ChatPipeline : IDisposable
 
             Status?.Invoke("");
             return true;
+        }
+        catch (OperationCanceledException) when (_runCts?.IsCancellationRequested == true)
+        {
+            // 手动停止：历史留中断标记（assistant 角色保持 user/assistant 交替），模型下次知道任务被终止、做到哪了
+            lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = "[system] 用户手动停止了本次任务（未完成）。进度见历史与 Todo 列表，不要假设未完成的步骤已成功；若用户要求继续，从上次停止处接着做。" });
+            NotifyHistory();
+            Status?.Invoke("已停止");
+            return false;
         }
         catch (Exception ex)
         {
@@ -404,6 +442,8 @@ public sealed class ChatPipeline : IDisposable
         finally
         {
             IsRunning = false;
+            _runCts = null;
+            cts.Dispose();
             _gate.Release();
         }
     }
@@ -412,20 +452,22 @@ public sealed class ChatPipeline : IDisposable
     {
         await _gate.WaitAsync();
         IsRunning = true;
+        var cts = new CancellationTokenSource();
+        _runCts = cts;
         try
         {
             var silence = RandomSilenceTurn();
-            await MaybeCompressAsync(); // 请求前压缩，不占 TTS 时间
+            await MaybeCompressAsync(cts.Token); // 请求前压缩，不占 TTS 时间
             NotifyHistory();
             var messages = await BuildMessagesAsync(ProactiveInstruction());
             if (messages.Count == 0 || messages[^1].Role != "user")
                 messages.Add(new ChatMessage { Role = "user", Content = silence });
 
-            var rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature);
+            var rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature, cts.Token);
             if (_lastProactive != null && IsNearRepeat(rawReply, _lastProactive))
             {
                 messages[^1] = new ChatMessage { Role = "user", Content = messages[^1].Content + "\n" + ProactiveRepeatInstruction() };
-                rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature);
+                rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature, cts.Token);
             }
             _lastProactive = rawReply;
 
@@ -443,6 +485,12 @@ public sealed class ChatPipeline : IDisposable
             Status?.Invoke("");
             return true;
         }
+        catch (OperationCanceledException) when (_runCts?.IsCancellationRequested == true)
+        {
+            // 手动停止主动搭话：无任务状态，不留标记
+            Status?.Invoke("");
+            return false;
+        }
         catch (Exception ex)
         {
             Log.Error("ChatPipeline.RunProactiveAsync failed", ex);
@@ -452,6 +500,8 @@ public sealed class ChatPipeline : IDisposable
         finally
         {
             IsRunning = false;
+            _runCts = null;
+            cts.Dispose();
             _gate.Release();
         }
     }
@@ -502,7 +552,7 @@ public sealed class ChatPipeline : IDisposable
         return "（刚才说了重复的内容，请换个新话题搭话）";
     }
 
-    private async Task<string> CompleteAsync(List<ChatMessage> messages, double? temperatureOverride = null)
+    private async Task<string> CompleteAsync(List<ChatMessage> messages, double? temperatureOverride = null, CancellationToken ct = default)
     {
         var ep = _config.EffectiveLlm();
         DebugLog?.Invoke(FormatRequest(ep.Url, ep.Model, messages));
@@ -513,7 +563,8 @@ public sealed class ChatPipeline : IDisposable
             temperatureOverride ?? _config.EffectiveTemperature,
             _config.EffectiveMaxTokens,
             ep.ApiKey,
-            ep.ExtraParams);
+            ep.ExtraParams,
+            ct);
         OnUsageSample(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0)); // 真实上下文 token：显示+比率校准
         DebugLog?.Invoke(FormatReply(result.Text));
         return result.Text;
@@ -673,7 +724,7 @@ public sealed class ChatPipeline : IDisposable
         return sb.ToString().Trim();
     }
 
-    private async Task MaybeCompressAsync()
+    private async Task MaybeCompressAsync(CancellationToken ct = default)
     {
         var max = _config.Chat.ContextLength;
         // 有效预算（用户设置 ∩ 模型实际上限）→ 字数预算（校准比率折算，未校准时默认 ~1.5 字/token）：压缩发生在请求前，只能用本地估算
@@ -712,7 +763,8 @@ public sealed class ChatPipeline : IDisposable
         try
         {
             MemoryArchive.Append(_config, chunk); // 先归档再压缩：即使摘要失败，原始记录也在 memory_archive.json 里
-            _summary = await CompressAsync(chunk, _summary);
+            _summary = await CompressAsync(chunk, _summary, ct);
+            if (ct.IsCancellationRequested) return; // 停止发生在摘要期间：不删历史（避免无摘要丢原文）
             lock (_histLock) _history.RemoveRange(0, Math.Min(chunk.Count, Math.Max(0, _history.Count - 2)));
         }
         finally { SetCompressing(false); }
@@ -722,7 +774,7 @@ public sealed class ChatPipeline : IDisposable
         Log.Info($"History compressed: {count} msgs / budget {unit} -> {after} msgs");
     }
 
-    private async Task<string> CompressAsync(List<ChatMessage> chunk, string? prevSummary)
+    private async Task<string> CompressAsync(List<ChatMessage> chunk, string? prevSummary, CancellationToken ct = default)
     {
         try
         {
@@ -822,9 +874,13 @@ public sealed class ChatPipeline : IDisposable
             var ep = _config.EffectiveLlm();
             // 摘要请求不携带完整历史，其 usage 不代表上下文占用，故不采样
             var result = await LlamaClient.CompleteAsync(
-                ep.Url, messages, ep.Model, 0.3, SummaryMaxTokens(), ep.ApiKey, ep.ExtraParams);
+                ep.Url, messages, ep.Model, 0.3, SummaryMaxTokens(), ep.ApiKey, ep.ExtraParams, ct);
             var summary = result.Text;
             return string.IsNullOrWhiteSpace(summary) ? (prevSummary ?? "") : summary.Trim();
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // 手动停止：让上层感知（不删历史、不留"压缩失败"日志）
         }
         catch (Exception ex)
         {

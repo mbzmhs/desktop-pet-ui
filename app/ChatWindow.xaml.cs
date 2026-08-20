@@ -501,6 +501,7 @@ public partial class ChatWindow : Window
     {
         SetStatus("发送中…");
         await _pipeline.RunAsync(text, App.PetWindow!);
+        UpdateStopButton(); // 兜底：停止/出错路径的 Status 回调可能先于 IsRunning=false
         // QQ 式常驻窗口：回复后不自动隐藏，Esc/关闭按钮收起
     }
 
@@ -509,11 +510,21 @@ public partial class ChatWindow : Window
         // 确认点击后 agent 续体在线程池线程上跑，Status 可能从后台线程回调
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.BeginInvoke(new Action(() => StatusText.Text = msg));
+            Dispatcher.BeginInvoke(new Action(() => { StatusText.Text = msg; UpdateStopButton(); }));
             return;
         }
         StatusText.Text = msg;
+        UpdateStopButton();
     }
+
+    /// <summary>运行中显示红色"停止"按钮；管线结束后隐藏（RunAsync 返回时也兜底刷新一次）。</summary>
+    private void UpdateStopButton()
+    {
+        if (StopBtn == null) return;
+        StopBtn.Visibility = _pipeline.IsRunning ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private void OnStopClick(object sender, RoutedEventArgs e) => _pipeline.Stop();
 
     private void OnCloseClick(object sender, RoutedEventArgs e)
     {
@@ -555,7 +566,7 @@ public partial class ChatWindow : Window
         _ => MakeBrush("#4A5568"),
     };
 
-    /// <summary>是否 agent 协议消息（[tool] 调用 / [result] [error] [note] 反馈），区别于普通对话。</summary>
+    /// <summary>是否 agent 协议消息（[tool] 调用 / [result] [error] [note] 反馈 / [system] 系统标记），区别于普通对话。</summary>
     private static bool IsProtocolMessage(ChatMessage m)
     {
         var c = (m.Content ?? "").TrimStart();
@@ -563,7 +574,8 @@ public partial class ChatWindow : Window
             return c.StartsWith("[result]", StringComparison.OrdinalIgnoreCase)
                 || c.StartsWith("[error]", StringComparison.OrdinalIgnoreCase)
                 || c.StartsWith("[note]", StringComparison.OrdinalIgnoreCase);
-        return c.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0;
+        return c.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0
+            || c.StartsWith("[system]", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>工具往返紧凑行：小字号等宽、低对比，贴在消息流里不喧宾夺主。</summary>
@@ -577,6 +589,11 @@ public partial class ChatWindow : Window
             else if (c.StartsWith("[error]", StringComparison.OrdinalIgnoreCase)) { prefix = "!"; text = c.Substring(7).Trim(); }
             else if (c.StartsWith("[result]", StringComparison.OrdinalIgnoreCase)) { prefix = "↩"; text = c.Substring(8).Trim(); }
             else { prefix = "↩"; text = c; }
+        }
+        else if (c.StartsWith("[system]", StringComparison.OrdinalIgnoreCase))
+        {
+            prefix = "✦"; // 系统信息（如手动停止标记）：紧凑行，不占宠物气泡
+            text = c.Substring(9).Trim();
         }
         else
         {

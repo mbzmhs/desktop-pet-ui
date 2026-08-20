@@ -152,10 +152,11 @@ public static class MarkdownRenderer
         return tb;
     }
 
-    /// <summary>行内格式：`code` &gt; **bold** &gt; ~~strike~~ &gt; *italic* &gt; [text](url)。</summary>
+    /// <summary>行内格式：`code` &gt; **bold** &gt; ~~strike~~ &gt; *italic* &gt; [text](url)。未配对的格式字符按字面输出。</summary>
     private static void AppendInlines(InlineCollection target, string s)
     {
-        for (var i = 0; i < s.Length; i++)
+        var i = 0;
+        while (i < s.Length)
         {
             var c = s[i];
 
@@ -170,9 +171,12 @@ public static class MarkdownRenderer
                         FontSize = 12.5,
                         Background = InlineCodeBg,
                     });
-                    i = end;
+                    i = end + 1; // 跳过收尾反引号
                     continue;
                 }
+                target.Add(new Run("`"));
+                i++;
+                continue;
             }
 
             if (c == '*' && i + 1 < s.Length && s[i + 1] == '*')
@@ -185,7 +189,7 @@ public static class MarkdownRenderer
                     foreach (Inline inl in span.Inlines)
                         if (inl is Run r) r.FontWeight = FontWeights.Bold;
                     target.Add(span);
-                    i = end + 1;
+                    i = end + 2; // 跳过收尾 **
                     continue;
                 }
             }
@@ -196,7 +200,7 @@ public static class MarkdownRenderer
                 if (end > i + 1)
                 {
                     target.Add(new Run(s[(i + 2)..end]) { TextDecorations = TextDecorations.Strikethrough });
-                    i = end + 1;
+                    i = end + 2; // 跳过收尾 ~~
                     continue;
                 }
             }
@@ -207,7 +211,7 @@ public static class MarkdownRenderer
                 if (end > i + 1)
                 {
                     target.Add(new Run(s[(i + 1)..end]) { FontStyle = FontStyles.Italic });
-                    i = end;
+                    i = end + 1; // 跳过收尾 *
                     continue;
                 }
             }
@@ -221,21 +225,21 @@ public static class MarkdownRenderer
                     if (paren > close)
                     {
                         target.Add(new Run(s[(i + 1)..close]) { Foreground = LinkBrush });
-                        i = paren;
+                        i = paren + 1; // 跳过收尾 )
                         continue;
                     }
                 }
+                // 不是合法链接：'[' 按字面输出
+                target.Add(new Run("["));
+                i++;
+                continue;
             }
 
-            var plain = new StringBuilder(1);
-            while (i < s.Length)
-            {
-                var ch = s[i];
-                if (ch is '`' or '*' or '~' or '[') break;
-                plain.Append(ch);
-                i++;
-            }
-            target.Add(new Run(plain.ToString()));
+            // 普通段直到下一个格式字符；若当前位置本身就是未配对的格式字符（如孤立 * ~），按字面输出保证前进
+            var start = i;
+            while (i < s.Length && !(s[i] is '`' or '*' or '~' or '[')) i++;
+            if (i > start) target.Add(new Run(s[start..i]));
+            else { target.Add(new Run(c.ToString())); i++; }
         }
     }
 
