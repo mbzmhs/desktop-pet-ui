@@ -341,9 +341,9 @@
                             <ColumnDefinition Width="*"/>
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0">
-                            <TextBlock Text="对话历史总字数上限（字）" Foreground="#444" Margin="0,0,0,4"/>
-                            <TextBox x:Name="ContextMaxCharsBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
-                            <TextBlock Text="0 表示不启用字数压缩；超过条数或字数上限即压缩，摘要输出量约为 1/8" Foreground="#999" Margin="0,4,0,0"/>
+                            <TextBlock Text="上下文预算（token）" Foreground="#444" Margin="0,0,0,4"/>
+                            <TextBox x:Name="ContextMaxTokensBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                            <TextBlock Text="历史 token 量达到它的 70% 时压缩最旧部分；聊天窗标题栏实时显示占用比。按所用模型上下文调整（本地 ≤64k 建议 ≤16000，外部大上下文 API 可更大）；摘要输出量约为 1/8" Foreground="#999" Margin="0,4,0,0"/>
                         </StackPanel>
                         <StackPanel Grid.Column="1">
                             <TextBlock Text="归档记录上限（条）" Foreground="#444" Margin="0,0,0,4"/>
@@ -433,8 +433,22 @@
                         </ComboBox>
                     </Grid>
 
-                    <TextBlock Text="权限说明：自动=新建文件自动放行、覆盖/删除先确认；可写入=写操作全部自动放行；只读=一切写/删都先确认。PowerShell 命令按同一套规则分级：只读命令直接执行；非只读命令仅当全部字面路径都在允许范围内（信任目录/可写范围）才自动执行，含变量等无法判定的命令一律先确认。"
+                    <TextBlock Text="权限说明：自动=新建文件自动放行、覆盖/删除先确认；可写入=写操作全部自动放行；只读=一切写/删都先确认。PowerShell 命令按同一套规则分级：低风险命令按下方策略自动放行；非只读命令仅当全部字面路径都在允许范围内（信任目录/可写范围）才自动执行，含变量等无法判定的命令一律先确认。模型自评高风险的命令在任何策略下都会先确认。"
                                Foreground="#888" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+                    <Grid Margin="0,12,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="6"/>
+                            <ColumnDefinition Width="230"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="PowerShell 低风险命令自动放行" Foreground="#444" VerticalAlignment="Center"/>
+                        <ComboBox x:Name="PsAutoPolicyCombo" Grid.Column="2">
+                            <ComboBoxItem Content="双重审核（推荐）" Tag="dual"/>
+                            <ComboBoxItem Content="只交给 LLM 决定（宽松但有风险）" Tag="llm"/>
+                            <ComboBoxItem Content="不自动放行" Tag="off"/>
+                        </ComboBox>
+                    </Grid>
 
                     <TextBlock Text="信任目录（其下文件操作直接放行；字面路径全部位于其中的 PowerShell 命令也放行。可在确认弹窗中一键添加）" Foreground="#444" Margin="0,12,0,4"/>
                     <Grid>

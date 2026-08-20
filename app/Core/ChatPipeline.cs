@@ -25,6 +25,9 @@ public sealed class ChatPipeline : IDisposable
     private readonly AgentRunner _agent;
     private Action<string>? _debugLog;
     private string? _summary;
+    private int _lastPromptTokens; // 最近一次真实上下文 token（API usage.prompt_tokens）
+    private double _tokPerChar;    // 校准的 token/字 比率（0=尚未校准，按默认 ~1.5 字/token 折算）
+    private int _lastSystemChars;  // 上一轮实际发送的系统提示词字数（压缩估算用：预算覆盖整次请求=系统+历史）
     private string? _lastProactive;
     private HashSet<string>? _availableEmotions;
     private DateTime _emotionsFetchedAt;
@@ -46,7 +49,40 @@ public sealed class ChatPipeline : IDisposable
     public event Action? HistoryChanged;
     /// <summary>agent 工具调用裁定事件（auto/allowed/denied），已持久化到 agent_ops.json 后在后台线程触发。</summary>
     public event Action<AgentOpRecord>? OpAdded;
+    /// <summary>上下文用量更新（API usage.prompt_tokens；后台线程触发，UI 侧自行切线程）。</summary>
+    public event Action? UsageChanged;
+    /// <summary>历史压缩进行中变化（true=开始压缩，false=结束；后台线程触发）。压缩期间聊天窗应提示并锁定输入。</summary>
+    public event Action<bool>? CompressingChanged;
     public bool IsRunning { get; private set; }
+    /// <summary>是否正在压缩历史（摘要 LLM 调用中）。</summary>
+    public bool IsCompressing { get; private set; }
+
+    private void SetCompressing(bool v)
+    {
+        if (IsCompressing == v) return;
+        IsCompressing = v;
+        CompressingChanged?.Invoke(v);
+    }
+
+    /// <summary>最近一次真实上下文 token 数（API usage.prompt_tokens）；0=尚无完成请求。</summary>
+    public int LastPromptTokens => _lastPromptTokens;
+
+    /// <summary>校准的 token/字 比率（来自实际 usage÷发送字数）；未校准时按 ~1.5 字/token 折算。</summary>
+    public double TokPerChar => _tokPerChar > 0 ? _tokPerChar : 1.0 / 1.5;
+
+    /// <summary>采样一次真实 token 用量：刷新显示值并校准折算比率。
+    /// 只用于携带完整历史的请求（主聊天、agent 每步）；摘要压缩请求载荷不同，不在此采样。</summary>
+    public void OnUsageSample(int promptTokens, int sentChars)
+    {
+        if (promptTokens <= 0) return;
+        _lastPromptTokens = promptTokens;
+        if (sentChars > 200)
+        {
+            var r = promptTokens / (double)sentChars;
+            if (r > 0.1 && r < 2.0) _tokPerChar = Math.Clamp(r, 0.2, 1.5);
+        }
+        UsageChanged?.Invoke();
+    }
 
     /// <summary>线程安全的历史快照（加锁拷贝），UI 线程可放心遍历。</summary>
     public IReadOnlyList<ChatMessage> History { get { lock (_histLock) return _history.ToList(); } }
@@ -70,6 +106,8 @@ public sealed class ChatPipeline : IDisposable
             lock (_histLock) _history.Add(new ChatMessage { Role = m.Role, Content = m.Content });
             NotifyHistory();
         };
+        // agent 循环每步也带 system+完整历史，其 usage 同样代表上下文占用（显示与比率校准）
+        _agent.OnUsage = (pt, sc) => OnUsageSample(pt, sc);
     }
 
     public void Restore(string? summary, IEnumerable<ChatMessage> history)
@@ -272,12 +310,32 @@ public sealed class ChatPipeline : IDisposable
         if (!string.IsNullOrWhiteSpace(extraSystem))
             system = string.IsNullOrWhiteSpace(system) ? extraSystem : system + "\n\n" + extraSystem;
         SystemPromptDebug?.Invoke(system);
+        _lastSystemChars = system.Length; // 供下一轮压缩估算（预算=系统+历史，与 usage.prompt_tokens 口径一致）
 
         var messages = new List<ChatMessage>();
         if (!string.IsNullOrWhiteSpace(system))
             messages.Add(new ChatMessage { Role = "system", Content = system });
-        messages.AddRange(Sanitize(History)); // 加锁快照，避免与 UI 线程遍历竞争
+        var history = Sanitize(History); // 加锁快照，避免与 UI 线程遍历竞争
+        ShrinkOldProtocol(history);     // agent 工具往返老化收缩：只影响发给模型的上下文
+        messages.AddRange(history);
         return messages;
+    }
+
+    /// <summary>agent 工具往返老化收缩：距末尾超过最近 10 条的协议消息截掉超长载荷，把上下文预算让给情感对话。
+    /// 只修改发给模型的内存列表；_history、memory.json 与归档均不变（UI 仍显示全文）。</summary>
+    private static void ShrinkOldProtocol(List<ChatMessage> msgs)
+    {
+        const int keepRecent = 10; // 最近 10 条保持完整：模型的工具用法示例
+        var start = Math.Max(0, msgs.Count - keepRecent);
+        for (var i = 0; i < start; i++)
+        {
+            var c = msgs[i].Content ?? "";
+            if (c.Length <= 400) continue;
+            if (c.StartsWith("[tool]"))
+                msgs[i].Content = c[..300] + "…";
+            else if (c.StartsWith("[result]") || c.StartsWith("[error]") || c.StartsWith("[note]"))
+                msgs[i].Content = Truncate(c, 240);
+        }
     }
 
     public async Task<bool> RunAsync(string userText, ISpeakHost host)
@@ -290,10 +348,12 @@ public sealed class ChatPipeline : IDisposable
             NotifyHistory();
             Status?.Invoke("思考中…");
 
+            await MaybeCompressAsync(); // 请求前压缩（对齐 opencode），不占 TTS 时间；滞回保证不会每轮都压
+            NotifyHistory();
             var messages = await BuildMessagesAsync();
             string rawReply;
             if (_config.Chat.Agent.Enabled)
-                rawReply = await _agent.RunAsync(messages, host); // 工具循环，中间往返不进历史
+                rawReply = await _agent.RunAsync(messages, host); // 工具循环（中间往返经 OnMessage 进长期历史）
             else
                 rawReply = await CompleteAsync(messages);
             lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
@@ -302,8 +362,6 @@ public sealed class ChatPipeline : IDisposable
             var (specs, fullText) = await PlanSegmentsAsync(rawReply);
             await SpeakPlannedAsync(host, fullText, specs);
 
-            await MaybeCompressAsync();
-            NotifyHistory();
             Status?.Invoke("");
             return true;
         }
@@ -327,6 +385,8 @@ public sealed class ChatPipeline : IDisposable
         try
         {
             var silence = RandomSilenceTurn();
+            await MaybeCompressAsync(); // 请求前压缩，不占 TTS 时间
+            NotifyHistory();
             var messages = await BuildMessagesAsync(ProactiveInstruction());
             if (messages.Count == 0 || messages[^1].Role != "user")
                 messages.Add(new ChatMessage { Role = "user", Content = silence });
@@ -349,7 +409,6 @@ public sealed class ChatPipeline : IDisposable
                 _history.Add(new ChatMessage { Role = "user", Content = silence });
                 _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             }
-            await MaybeCompressAsync();
             NotifyHistory();
             Status?.Invoke("");
             return true;
@@ -417,7 +476,7 @@ public sealed class ChatPipeline : IDisposable
     {
         var ep = _config.EffectiveLlm();
         DebugLog?.Invoke(FormatRequest(ep.Url, ep.Model, messages));
-        var reply = await LlamaClient.CompleteAsync(
+        var result = await LlamaClient.CompleteAsync(
             ep.Url,
             messages,
             ep.Model,
@@ -425,8 +484,9 @@ public sealed class ChatPipeline : IDisposable
             _config.EffectiveMaxTokens,
             ep.ApiKey,
             ep.ExtraParams);
-        DebugLog?.Invoke(FormatReply(reply));
-        return reply;
+        OnUsageSample(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0)); // 真实上下文 token：显示+比率校准
+        DebugLog?.Invoke(FormatReply(result.Text));
+        return result.Text;
     }
 
     private static string FormatRequest(string url, string model, List<ChatMessage> messages)
@@ -586,28 +646,50 @@ public sealed class ChatPipeline : IDisposable
     private async Task MaybeCompressAsync()
     {
         var max = _config.Chat.ContextLength;
-        var maxChars = _config.Chat.ContextMaxChars;
+        // token 预算 → 字数预算（校准比率折算，未校准时默认 ~1.5 字/token）：压缩发生在请求前，只能用本地估算
+        var maxChars = _config.Chat.ContextMaxTokens > 0 ? (int)(_config.Chat.ContextMaxTokens / TokPerChar) : 0;
         if (max <= 0 && maxChars <= 0) return;
 
-        int count;
-        lock (_histLock) count = _history.Count;
+        List<ChatMessage> snap;
+        lock (_histLock) snap = _history.ToList();
+        var count = snap.Count;
+        var totalChars = snap.Sum(m => m.Content?.Length ?? 0);
+        // 预算覆盖整次请求（系统提示词+历史），与聊天窗标题栏显示一致——usage.prompt_tokens 是整请求量，
+        // 若只按历史比较，系统提示词（几千 token）会造成"显示已超预算却不触发压缩"的偏移
+        var sysChars = _lastSystemChars;
         var overflowCount = max > 0 ? count - max : 0;
-        var overflowChars = maxChars > 0 ? History.Sum(m => m.Content?.Length ?? 0) - maxChars : 0;
+        var overflowChars = maxChars > 0 ? totalChars + sysChars - maxChars : 0;
         if (overflowCount < 2 && overflowChars <= 0) return;
 
-        var take = max > 0 ? Math.Max(max / 2, 2) : 2;
-        if (take >= count) take = count / 2;
-        if (take < 2) return;
+        // 最小必要压缩：只压到剩余（系统+历史）≤ 预算的 70%（滞回，避免每轮反复压），绝不碰最近几轮
+        var targetCount = max > 0 ? (int)(max * 0.7) : int.MaxValue;
+        var targetChars = maxChars > 0 ? Math.Max(0, (long)(maxChars * 0.7) - sysChars) : long.MaxValue;
+        var prefix = new long[count + 1];
+        for (var i = 0; i < count; i++) prefix[i + 1] = prefix[i] + (snap[i].Content?.Length ?? 0);
+
+        int take = -1;
+        for (var t = Math.Min(4, count - 2); t <= count - 2; t++)
+        {
+            if (count - t <= targetCount && totalChars - prefix[t] <= targetChars) { take = t; break; }
+        }
+        if (take < 0) take = count - 2; // 仍超预算：压到只剩最后两条
+        if (take < 2 || count - take < 2) return;
 
         List<ChatMessage> chunk;
-        lock (_histLock) chunk = _history.GetRange(0, take);
-        MemoryArchive.Append(_config, chunk); // 先归档再压缩：即使摘要失败，原始记录也在 memory_archive.json 里
-        _summary = await CompressAsync(chunk, _summary);
-        lock (_histLock) _history.RemoveRange(0, Math.Min(take, _history.Count));
+        lock (_histLock) chunk = _history.GetRange(0, Math.Min(take, Math.Max(0, _history.Count - 2)));
+        if (chunk.Count < 2) return;
+        SetCompressing(true); // 聊天窗提示"整理记忆中"+锁定输入
+        try
+        {
+            MemoryArchive.Append(_config, chunk); // 先归档再压缩：即使摘要失败，原始记录也在 memory_archive.json 里
+            _summary = await CompressAsync(chunk, _summary);
+            lock (_histLock) _history.RemoveRange(0, Math.Min(chunk.Count, Math.Max(0, _history.Count - 2)));
+        }
+        finally { SetCompressing(false); }
         int after;
         lock (_histLock) after = _history.Count;
-        var unit = maxChars > 0 ? "chars" : "n/a";
-        Log.Info($"History compressed: {count} msgs / {unit} -> {after} msgs");
+        var unit = _config.Chat.ContextMaxTokens > 0 ? _config.Chat.ContextMaxTokens + " tok" : "n/a";
+        Log.Info($"History compressed: {count} msgs / budget {unit} -> {after} msgs");
     }
 
     private async Task<string> CompressAsync(List<ChatMessage> chunk, string? prevSummary)
@@ -619,10 +701,25 @@ public sealed class ChatPipeline : IDisposable
             List<ChatMessage> messages;
             if (lang == "ja")
             {
-                sb.AppendLine("以下の会話（以前の要約も含む）を、会話の言語（日本語）で簡潔な要約にしてください。");
-                sb.AppendLine("ユーザーの好み・話題・出来事・約束・気分などの重要な情報を残してください。");
-                sb.AppendLine("要約だけを出力してください。");
-                if (!string.IsNullOrWhiteSpace(prevSummary)) sb.AppendLine("以前の要約：").AppendLine(prevSummary);
+                sb.AppendLine("以下の会話（以前の要約を含む）を日本語で構造化された記憶の要約に整理してください。必ず以下のセクションすべてを残して出力し、内容がなければ「（なし）」と書いてください：");
+                sb.AppendLine();
+                sb.AppendLine("## ユーザーとの関係");
+                sb.AppendLine("- 呼び方・好み・嫌いなもの・関係のトーン（具体的な名前はそのまま保持）");
+                sb.AppendLine("## 気分と約束");
+                sb.AppendLine("- 最近の気分；約束・取り決め（果たしていないものは必ず保持）；触れにくい話題");
+                sb.AppendLine("## 出来事");
+                sb.AppendLine("- 感情的に意味のある重要な出来事（日時+内容）、重複は統合可だが事実は落とさない");
+                sb.AppendLine("## agent操作");
+                sb.AppendLine("- 実行した主な操作（コマンド/パスはそのまま保持）、ユーザーが拒否した操作、信頼ディレクトリの変更");
+                sb.AppendLine("## 次の一手");
+                sb.AppendLine("- 未完の会話の糸口や未処理事項");
+                sb.AppendLine();
+                sb.AppendLine("ルール：短い箇条書きにすること（段落にしない）；具体的なパス・コマンド・ファイル名・人名をそのまま保持；要約本体のみ出力し、「要約」ということ自体には触れないこと。");
+                if (!string.IsNullOrWhiteSpace(prevSummary))
+                {
+                    sb.AppendLine("統合ルール：旧要約で果たしていない約束と長期的な好みは必ず引き継ぐこと；新旧が矛盾すれば新しい方を正とする。");
+                    sb.AppendLine("以前の要約：").AppendLine(prevSummary);
+                }
                 sb.AppendLine("要約する会話：");
                 foreach (var m in chunk) sb.Append(m.Role).Append(": ").Append(m.Content).AppendLine();
 
@@ -634,10 +731,25 @@ public sealed class ChatPipeline : IDisposable
             }
             else if (lang == "en")
             {
-                sb.AppendLine("Please summarize the following conversation (including any previous summary) concisely in English.");
-                sb.AppendLine("Keep important information: the user's preferences, topics, events, promises, and mood.");
-                sb.AppendLine("Output only the summary itself.");
-                if (!string.IsNullOrWhiteSpace(prevSummary)) sb.AppendLine("Previous summary:").AppendLine(prevSummary);
+                sb.AppendLine("Summarize the conversation below (including any previous summary) into a structured memory summary in English. Output exactly these sections, keeping every one (write \"(none)\" when empty):");
+                sb.AppendLine();
+                sb.AppendLine("## User & Relationship");
+                sb.AppendLine("- address, preferences, pet peeves, tone of the relationship (keep exact names verbatim)");
+                sb.AppendLine("## Mood & Commitments");
+                sb.AppendLine("- recent mood; promises and commitments (unfulfilled ones MUST be kept); sensitive topics");
+                sb.AppendLine("## What Happened");
+                sb.AppendLine("- important events with emotional significance (time + content); merge duplicates but never drop facts");
+                sb.AppendLine("## Agent Actions");
+                sb.AppendLine("- key operations performed (keep commands/paths verbatim), operations the user declined, trusted-dir changes");
+                sb.AppendLine("## Next Steps");
+                sb.AppendLine("- open threads or pending items");
+                sb.AppendLine();
+                sb.AppendLine("Rules: terse bullets, not prose; preserve exact paths, commands, file names and personal names; output only the summary itself, do not mention that a summary was made.");
+                if (!string.IsNullOrWhiteSpace(prevSummary))
+                {
+                    sb.AppendLine("Merge rules: carry forward unfulfilled commitments and long-term preferences from the prior summary; where old and new conflict, the newer wins.");
+                    sb.AppendLine("Previous summary:").AppendLine(prevSummary);
+                }
                 sb.AppendLine("Conversation to summarize:");
                 foreach (var m in chunk) sb.Append(m.Role).Append(": ").Append(m.Content).AppendLine();
 
@@ -649,10 +761,25 @@ public sealed class ChatPipeline : IDisposable
             }
             else
             {
-                sb.AppendLine("请将下面的对话（包含之前的摘要）用简体中文整理成一份简洁的摘要。");
-                sb.AppendLine("请保留用户的重要信息：喜好、话题、发生过的事、约定、情绪等。");
-                sb.AppendLine("只输出摘要本身。");
-                if (!string.IsNullOrWhiteSpace(prevSummary)) sb.AppendLine("之前的摘要：").AppendLine(prevSummary);
+                sb.AppendLine("请将下面的对话（包含之前的摘要）用简体中文整理成一份结构化的记忆摘要。严格按以下模板输出，保留所有小节（无内容写\"（无）\"）：");
+                sb.AppendLine();
+                sb.AppendLine("## 用户与关系");
+                sb.AppendLine("- 称呼、喜好、雷点、关系基调（具体名称原样保留）");
+                sb.AppendLine("## 情绪与约定");
+                sb.AppendLine("- 近期情绪基调；承诺与约定（未兑现的必须保留）；敏感话题");
+                sb.AppendLine("## 发生过的事");
+                sb.AppendLine("- 有情感意义的重要事件（时间+内容），可合并去重，但不要丢失事实");
+                sb.AppendLine("## agent操作");
+                sb.AppendLine("- 执行过的关键操作（命令/路径原样保留）、被用户拒绝的操作、信任目录变更");
+                sb.AppendLine("## 下一步");
+                sb.AppendLine("- 未完成的对话线索或待办");
+                sb.AppendLine();
+                sb.AppendLine("规则：使用简短要点，不要段落；原样保留具体路径、命令、文件名与人名；只输出摘要本身，不要提及\"摘要\"这件事。");
+                if (!string.IsNullOrWhiteSpace(prevSummary))
+                {
+                    sb.AppendLine("合并规则：旧摘要中未兑现的承诺与长期偏好必须带过；新旧冲突以新为准。");
+                    sb.AppendLine("之前的摘要：").AppendLine(prevSummary);
+                }
                 sb.AppendLine("需要摘要的对话：");
                 foreach (var m in chunk) sb.Append(m.Role).Append(": ").Append(m.Content).AppendLine();
 
@@ -663,8 +790,10 @@ public sealed class ChatPipeline : IDisposable
                 };
             }
             var ep = _config.EffectiveLlm();
-            var summary = await LlamaClient.CompleteAsync(
+            // 摘要请求不携带完整历史，其 usage 不代表上下文占用，故不采样
+            var result = await LlamaClient.CompleteAsync(
                 ep.Url, messages, ep.Model, 0.3, SummaryMaxTokens(), ep.ApiKey, ep.ExtraParams);
+            var summary = result.Text;
             return string.IsNullOrWhiteSpace(summary) ? (prevSummary ?? "") : summary.Trim();
         }
         catch (Exception ex)
@@ -674,12 +803,12 @@ public sealed class ChatPipeline : IDisposable
         }
     }
 
-    /// <summary>摘要输出的 token 上限：按「对话历史总字数上限」的 1/8 计算（约 4000 字 → 500 token），带上下限兜底。</summary>
+    /// <summary>摘要输出的 token 上限：按「上下文预算」的 1/8 计算，下限 512（结构化模板需要空间）、上限 2048。</summary>
     private int SummaryMaxTokens()
     {
-        var budget = _config.Chat.ContextMaxChars;
-        if (budget <= 0) budget = 4000;
-        return Math.Clamp(budget / 8, 256, 2048);
+        var budget = _config.Chat.ContextMaxTokens;
+        if (budget <= 0) budget = 16000;
+        return Math.Clamp(budget / 8, 512, 2048);
     }
 
     public void ClearHistory()
@@ -710,12 +839,17 @@ public sealed class ChatPipeline : IDisposable
         {
             List<ChatMessage> chunk;
             lock (_histLock) chunk = History.ToList();
-            MemoryArchive.Append(_config, chunk); // 归档后再清空
-            var result = await CompressAsync(chunk, _summary);
-            lock (_histLock) _history.Clear();
-            _lastProactive = null;
-            _summary = string.IsNullOrWhiteSpace(result) ? null : result.Trim();
-            NotifyHistory();
+            SetCompressing(true); // 手动压缩同样提示+锁定输入
+            try
+            {
+                MemoryArchive.Append(_config, chunk); // 归档后再清空
+                var result = await CompressAsync(chunk, _summary);
+                lock (_histLock) _history.Clear();
+                _lastProactive = null;
+                _summary = string.IsNullOrWhiteSpace(result) ? null : result.Trim();
+                NotifyHistory();
+            }
+            finally { SetCompressing(false); }
             return !string.IsNullOrWhiteSpace(_summary);
         }
         catch (Exception ex)

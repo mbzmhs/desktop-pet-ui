@@ -319,7 +319,7 @@ ExtraParamsBox.Text = CurrentProviderExtra();
         TtsUrlBox.Text = _config.Chat.Tts.Url ?? "";
         TtsStreamingCheck.IsChecked = _config.Chat.Tts.Streaming;
         ContextLengthBox.Text = _config.Chat.ContextLength.ToString();
-        ContextMaxCharsBox.Text = _config.Chat.ContextMaxChars.ToString();
+        ContextMaxTokensBox.Text = _config.Chat.ContextMaxTokens.ToString();
         ArchiveMaxEntriesBox.Text = _config.Chat.ArchiveMaxEntries.ToString();
         ProactiveIntervalBox.Text = _config.Chat.ProactiveIntervalSec.ToString("0.###");
         IdleIntervalBox.Text = _config.Character.IdleIntervalSec.ToString("0.###");
@@ -339,6 +339,7 @@ ExtraParamsBox.Text = CurrentProviderExtra();
             : _config.Chat.Agent.WorkDir;
         AgentWorkDirPermCombo.SelectedIndex = TagIndex(AgentWorkDirPermCombo, _config.Chat.Agent.WorkDirPerm);
         AgentOtherDirPermCombo.SelectedIndex = TagIndex(AgentOtherDirPermCombo, _config.Chat.Agent.OtherDirPerm);
+        PsAutoPolicyCombo.SelectedIndex = TagIndex(PsAutoPolicyCombo, _config.Chat.Agent.PsAutoPolicy);
         // 直接绑定配置里的活集合（ObservableCollection）：增删即时刷新 UI，且与确认弹窗的"信任该目录"共享同一实例
         var tdirs = _config.Chat.Agent.TrustedDirs ??= new ObservableCollection<string>();
         TrustedDirsList.ItemsSource = tdirs;
@@ -431,8 +432,8 @@ ExtraParamsBox.Text = CurrentProviderExtra();
 
             if (int.TryParse(ContextLengthBox.Text?.Trim(), out var cl) && cl > 0)
                 _config.Chat.ContextLength = cl;
-            if (int.TryParse(ContextMaxCharsBox.Text?.Trim(), out var cmc) && cmc >= 0)
-                _config.Chat.ContextMaxChars = cmc;
+            if (int.TryParse(ContextMaxTokensBox.Text?.Trim(), out var cmt) && cmt >= 0)
+                _config.Chat.ContextMaxTokens = cmt;
             if (int.TryParse(ArchiveMaxEntriesBox.Text?.Trim(), out var ame) && ame >= 0)
                 _config.Chat.ArchiveMaxEntries = ame;
             if (double.TryParse(ProactiveIntervalBox.Text?.Trim(), out var pi) && pi > 0)
@@ -482,6 +483,8 @@ ExtraParamsBox.Text = CurrentProviderExtra();
                 _config.Chat.Agent.WorkDirPerm = (wi.Tag as string) ?? "auto";
             if (AgentOtherDirPermCombo.SelectedItem is ComboBoxItem oi)
                 _config.Chat.Agent.OtherDirPerm = (oi.Tag as string) ?? "auto";
+            if (PsAutoPolicyCombo.SelectedItem is ComboBoxItem pp)
+                _config.Chat.Agent.PsAutoPolicy = (pp.Tag as string) ?? "dual";
             // TrustedDirs 与 UI 是同一个集合，无需回写
             _config.Chat.Agent.AgentScreens = AgentScreensPanel.Children.OfType<System.Windows.Controls.CheckBox>()
                 .Where(c => c.IsChecked == true)

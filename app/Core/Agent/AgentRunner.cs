@@ -22,6 +22,9 @@ public sealed class AgentRunner
     /// <summary>循环中每追加一条工作消息（[tool] 调用 / [result] 反馈）触发，由管线写入长期历史。</summary>
     public Action<ChatMessage>? OnMessage { get; set; }
 
+    /// <summary>每次 LLM 补全后触发 (prompt_tokens, 发送总字数)；agent 每步都带完整历史，由管线校准 token/字比率并刷新显示。</summary>
+    public Action<int, int>? OnUsage { get; set; }
+
     public AgentRunner(AppConfig config) => _config = config;
 
     /// <summary>
@@ -86,7 +89,7 @@ public sealed class AgentRunner
                     Log.Info($"Agent step {step}/{maxSteps}: {call.Name} raw={EscapeForLog(jsonText)}");
                     DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 工具调用: " + call.Name + "  " + call.Description.Replace("\n", " ⏎ "));
 
-                    var tier = AgentTools.Classify(call.Name, call.Args, _config);
+                    var (tier, autoReason) = AgentTools.Classify(call, _config);
                     if (tier == ToolTier.Auto && call.Risk == "high" && !AgentTools.TargetInTrustedDir(call, _config))
                         tier = ToolTier.Confirm; // 模型自评高风险 → 升级为确认（宿主分级仍是底线；信任目录豁免——用户已显式授权其下文件操作）
                     string? trustNote = null;
@@ -112,11 +115,11 @@ public sealed class AgentRunner
                             trustNote = "用户已授权目录「" + trustDir + "」：其下文件操作直接放行，字面路径全部位于该目录的 PowerShell 命令也无需再问（无路径/含变量的命令仍会确认）。";
                     }
 
-                    // 审计记录：每次工具调用的裁定都持久化（自动放行 / 用户允许 / 用户拒绝）
+                    // 审计记录：每次工具调用的裁定都持久化（自动放行 / 用户允许 / 用户拒绝）；auto 备注=真实放行原因
                     var verdict = feedback != null ? "denied" : (tier == ToolTier.Auto ? "auto" : "allowed");
                     var opNote = verdict switch
                     {
-                        "auto" => AgentTools.TargetInTrustedDir(call, _config) ? "信任目录" : "",
+                        "auto" => autoReason,
                         "allowed" => trustNote != null ? "并信任该目录" : "",
                         _ => "",
                     };
@@ -223,12 +226,14 @@ public sealed class AgentRunner
     {
         var ep = _config.EffectiveLlm();
         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] → agent llama " + ep.Url + " model=" + ep.Model);
-        var reply = await LlamaClient.CompleteAsync(
+        var result = await LlamaClient.CompleteAsync(
             ep.Url, messages, ep.Model,
             _config.EffectiveTemperature, _config.EffectiveMaxTokens,
             ep.ApiKey, ep.ExtraParams);
-        DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] ← agent llama 回复:\n" + reply);
-        return reply;
+        // 每步都带 system+完整历史：上报真实 usage（上下文占用显示与 token/字比率校准）
+        OnUsage?.Invoke(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0));
+        DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] ← agent llama 回复:\n" + result.Text);
+        return result.Text;
     }
 
     private const string SingleLineFormat = "[tool]{\"name\":\"工具名\",\"args\":{...}}[/tool]";

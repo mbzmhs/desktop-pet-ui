@@ -21,6 +21,15 @@ public sealed class ChatMessage
     public List<string>? ImageBase64s { get; set; }
 }
 
+/// <summary>API 响应中的 token 用量（非流式响应的 usage 字段，最准确的上下文占用来源）。</summary>
+public sealed record ChatUsage(int PromptTokens, int CompletionTokens, int TotalTokens)
+{
+    public static readonly ChatUsage Empty = new(0, 0, 0);
+}
+
+/// <summary>补全结果：回复文本 + token 用量。</summary>
+public sealed record ChatResult(string Text, ChatUsage Usage);
+
 public static class LlamaClient
 {
     private static HttpClient Http = CreateClient();
@@ -65,7 +74,7 @@ public static class LlamaClient
         try { old.Dispose(); } catch { }
     }
 
-    public static async Task<string> CompleteAsync(
+    public static async Task<ChatResult> CompleteAsync(
         string baseUrl,
         IReadOnlyList<ChatMessage> messages,
         string model,
@@ -118,7 +127,7 @@ public static class LlamaClient
         return u;
     }
 
-    private static async Task<string> CompleteInternalAsync(
+    private static async Task<ChatResult> CompleteInternalAsync(
         string baseUrl,
         IReadOnlyList<ChatMessage> messages,
         string model,
@@ -188,15 +197,28 @@ public static class LlamaClient
             var msg = err.ValueKind == JsonValueKind.String ? (err.GetString() ?? err.ToString()) : err.ToString();
             throw new Exception("llama.cpp 返回错误: " + Truncate(msg, 300));
         }
+
+        // usage：非流式响应直接携带（llama.cpp / OpenAI 兼容 API 均如此），prompt_tokens=本次请求实际占用的上下文 token
+        int promptTokens = 0, completionTokens = 0;
+        if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
+        {
+            if (usage.TryGetProperty("prompt_tokens", out var pt) && pt.ValueKind == JsonValueKind.Number) promptTokens = pt.GetInt32();
+            if (usage.TryGetProperty("completion_tokens", out var cpt) && cpt.ValueKind == JsonValueKind.Number) completionTokens = cpt.GetInt32();
+        }
+        int totalTokens = promptTokens + completionTokens;
+        if (root.TryGetProperty("usage", out var usage2) && usage2.ValueKind == JsonValueKind.Object &&
+            usage2.TryGetProperty("total_tokens", out var tt) && tt.ValueKind == JsonValueKind.Number)
+            totalTokens = tt.GetInt32();
+
         if (root.TryGetProperty("choices", out var choices) && choices.ValueKind == JsonValueKind.Array)
         {
             foreach (var choice in choices.EnumerateArray())
             {
                 if (choice.TryGetProperty("message", out var message) &&
                     message.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String)
-                    return c.GetString() ?? "";
+                    return new ChatResult(c.GetString() ?? "", new ChatUsage(promptTokens, completionTokens, totalTokens));
                 if (choice.TryGetProperty("text", out var t) && t.ValueKind == JsonValueKind.String)
-                    return t.GetString() ?? "";
+                    return new ChatResult(t.GetString() ?? "", new ChatUsage(promptTokens, completionTokens, totalTokens));
             }
         }
         throw new Exception("llama.cpp 响应缺少 choices[0].message.content");

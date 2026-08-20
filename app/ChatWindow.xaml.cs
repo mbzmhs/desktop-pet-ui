@@ -77,6 +77,8 @@ public partial class ChatWindow : Window
         _pipeline.Status = SetStatus;
         _pipeline.HistoryChanged += RebuildMessages;
         _pipeline.OpAdded += OnOpAdded;
+        _pipeline.UsageChanged += () => Dispatcher.Invoke(UpdateUsageLabel); // usage 在后台线程更新
+        _pipeline.CompressingChanged += v => Dispatcher.Invoke(() => OnCompressing(v)); // 压缩期间提示+锁定输入
         SizeChanged += (s, e) => SaveLayout(); // 拖角缩放后落盘
         TitleText.Text = "和" + (string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName) + "聊天";
         RebuildMessages();
@@ -92,10 +94,51 @@ public partial class ChatWindow : Window
         Show();
         Activate();
         RebuildMessages();
+        UpdateUsageLabel();
         if (_pipeline.IsRunning) return;
         InputBox.Focus();
         Keyboard.Focus(InputBox);
         SetStatus("");
+    }
+
+    // ---------------- 上下文占用显示 ----------------
+
+    /// <summary>标题栏实时显示：最近一次真实 prompt_tokens / 设置里的 token 预算（≥70% 黄、≥90% 红）。</summary>
+    private void UpdateUsageLabel()
+    {
+        if (UsageText == null) return;
+        var used = _pipeline.LastPromptTokens;
+        var budget = _config.Chat.ContextMaxTokens;
+        if (used <= 0 || budget <= 0)
+        {
+            UsageText.Visibility = Visibility.Collapsed;
+            return;
+        }
+        var pct = used / (double)budget * 100.0;
+        UsageText.Text = $"Context ≈{FmtTok(used)}/{FmtTok(budget)} · {pct:0}%";
+        UsageText.Foreground = new SolidColorBrush(pct >= 90 ? Color.FromRgb(0xE0, 0x60, 0x50)
+                                    : pct >= 70 ? Color.FromRgb(0xD8, 0xA8, 0x4A)
+                                    : Color.FromRgb(0x7A, 0xA0, 0x80));
+        UsageText.Visibility = Visibility.Visible;
+    }
+
+    private static string FmtTok(int t) => t >= 1000 ? (Math.Round(t / 100.0) / 10.0).ToString("0.#") + "k" : t.ToString();
+
+    // ---------------- 压缩期间锁定输入 ----------------
+
+    /// <summary>历史压缩进行中：状态行提示并禁用输入/发送；结束后若管线仍在跑则回到"思考中"。</summary>
+    private void OnCompressing(bool compressing)
+    {
+        InputBox.IsEnabled = !compressing;
+        SendBtn.IsEnabled = !compressing;
+        if (compressing)
+        {
+            SetStatus("正在整理记忆（压缩历史）…");
+        }
+        else
+        {
+            SetStatus(_pipeline.IsRunning ? "思考中…" : "");
+        }
     }
 
     // ---------------- 位置/尺寸记忆 ----------------
@@ -446,7 +489,8 @@ public partial class ChatWindow : Window
     private void Submit()
     {
         var text = InputBox.Text?.Trim();
-        if (string.IsNullOrEmpty(text) || _pipeline.IsRunning) return;
+        // 压缩期间输入框已禁用，这里再兜底一次（例如 Enter 事件先于 IsEnabled 生效的边界）
+        if (string.IsNullOrEmpty(text) || _pipeline.IsRunning || _pipeline.IsCompressing) return;
         InputBox.Clear();
         _ = RunAsync(text);
     }

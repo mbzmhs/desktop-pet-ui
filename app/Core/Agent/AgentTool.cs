@@ -249,8 +249,11 @@ public static class AgentTools
         return call;
     }
 
-    public static ToolTier Classify(string name, JsonObject args, AppConfig cfg)
+    /// <summary>权限分级 + 自动放行原因（供审计记录）。危险操作由宿主端强制分级，不依赖模型自觉。</summary>
+    public static (ToolTier Tier, string AutoReason) Classify(ParsedToolCall call, AppConfig cfg)
     {
+        var name = call.Name;
+        var args = call.Args;
         switch (name)
         {
             case "read_file":
@@ -261,43 +264,55 @@ public static class AgentTools
             case "check_job":
             case "ask_user":
             case "observe_screen":
-                return ToolTier.Auto;
+                return (ToolTier.Auto, "");
             case "write_file":
             case "edit_file":
             case "delete_file":
                 return ClassifyFileWrite(name, args, cfg);
             case "run_powershell":
             case "start_powershell":
-                // PowerShell 与文件操作同一套规则：只读命令直接放行；非只读命令的全部字面路径都须在允许范围内（fail-safe：判不准一律确认）
+                // PowerShell 与文件操作同一套规则：低风险路由（按 PsAutoPolicy）→ 路径范围路由；fail-safe：判不准一律确认
             {
-                var declaredReadOnly = GetBool(args, "read_only");
-                if (declaredReadOnly && IsReadOnlyCommand(arg(args, "command"))) return ToolTier.Auto;
-                if (PsPathsInScope(arg(args, "command"), GetStringList(args, "paths"), cfg)) return ToolTier.Auto;
-                return ToolTier.Confirm;
+                var cmd = arg(args, "command");
+                // LLM 侧信号：顶层 risk=low（协议定义 low=只读/无副作用）或工具参数 read_only=true
+                var llmSaysLow = string.Equals(call.Risk, "low", StringComparison.OrdinalIgnoreCase) || GetBool(args, "read_only");
+                switch ((cfg.Chat.Agent.PsAutoPolicy ?? "").Trim().ToLowerInvariant())
+                {
+                    case "llm":   // 宽松：信 LLM 自评，宿主不再复核
+                        if (llmSaysLow) return (ToolTier.Auto, "LLM自评低风险");
+                        break;
+                    case "dual":  // 双重审核（默认）：LLM 自评 + 宿主 IsLowRiskCommand 复核都过
+                        if (llmSaysLow && IsLowRiskCommand(cmd)) return (ToolTier.Auto, "低风险复核");
+                        break;
+                    default:      // off：声明路由关闭，只读命令一律确认
+                        break;
+                }
+                if (PsPathsInScope(cmd, GetStringList(args, "paths"), cfg)) return (ToolTier.Auto, "路径在允许范围");
+                return (ToolTier.Confirm, "");
             }
             default:
-                return ToolTier.Confirm; // 未知工具一律先问
+                return (ToolTier.Confirm, ""); // 未知工具一律先问
         }
     }
 
     /// <summary>文件写/删的权限分级：信任目录直接放行；否则按工作目录 / 其他目录的权限设定。</summary>
-    private static ToolTier ClassifyFileWrite(string name, JsonObject args, AppConfig cfg)
+    private static (ToolTier Tier, string AutoReason) ClassifyFileWrite(string name, JsonObject args, AppConfig cfg)
     {
         var agent = cfg.Chat.Agent;
         var target = ResolvePath(arg(args, "path"), cfg);
-        if (target.Length > 0 && InTrustedDir(target, cfg)) return ToolTier.Auto;
+        if (target.Length > 0 && InTrustedDir(target, cfg)) return (ToolTier.Auto, "信任目录");
 
         var perm = (target.Length > 0 && InWorkDir(target, cfg) ? agent.WorkDirPerm : agent.OtherDirPerm) ?? "";
         switch (perm.Trim().ToLowerInvariant())
         {
             case "write":
-                return ToolTier.Auto; // 该范围写操作全部自动放行
+                return (ToolTier.Auto, "范围全部可写"); // 该范围写操作全部自动放行
             case "readonly":
-                return ToolTier.Confirm; // 该范围一切写/删都先确认
+                return (ToolTier.Confirm, ""); // 该范围一切写/删都先确认
             default:
                 // auto：新建文件自动，覆盖已有文件 / 删除需确认
-                if (name == "write_file" && !File.Exists(target)) return ToolTier.Auto;
-                return ToolTier.Confirm;
+                if (name == "write_file" && !File.Exists(target)) return (ToolTier.Auto, "新建文件");
+                return (ToolTier.Confirm, "");
         }
     }
 
@@ -420,6 +435,96 @@ public static class AgentTools
         catch
         {
             return false; // 解析失败按非只读处理
+        }
+    }
+
+    /// <summary>低风险复核的扩展只读动词表：严格白名单 + ForEach-Object（纯迭代）+ ConvertFrom-*（解析数据）。</summary>
+    private static readonly string[] LowRiskReadOnlyVerbs = PsReadOnlyVerbs.Concat(new[] { "ForEach-", "ConvertFrom-" }).ToArray();
+
+    /// <summary>
+    /// 低风险 PowerShell 复核（PsAutoPolicy=dual 用）：宿主端静态校验无副作用的只读查询命令，不依赖模型自评。
+    /// 比 IsReadOnlyCommand 宽松：允许脚本块（Where-Object {$_.CPU -gt 100} 这类属性访问/比较）与 ForEach-Object；
+    /// 拒绝输出重定向、写特征词、.NET 静态调用（::）、方法调用（.Xxx()）与外部命令。任何一步判不准 → false（fail-safe → 弹确认）。
+    /// </summary>
+    public static bool IsLowRiskCommand(string command)
+    {
+        if (string.IsNullOrWhiteSpace(command)) return false;
+        try
+        {
+            var text = StripLineComments(command);
+            // 输出重定向写文件（> / >>），排除 -gt/-lt 等比较运算符
+            if (System.Text.RegularExpressions.Regex.IsMatch(text, "(^|[^\\w-])>{1,2}\\s")) return false;
+            // .NET 静态调用（[System.IO.File]::Delete 等）与方法调用（$x.Delete() 等）→ 非低风险
+            if (text.Contains("::")) return false;
+            if (System.Text.RegularExpressions.Regex.IsMatch(text, @"\.\s*[A-Za-z_]\w*\s*\(")) return false;
+
+            // 剔除字面路径（带连字符的文件名会被误认为 cmdlet token）
+            var scrubbed = text;
+            foreach (var p in ExtractPsPaths(text))
+                if (p.Length > 0) scrubbed = scrubbed.Replace(p, " ");
+
+            // 1) 摘除引号字符串（惰性数据）
+            var unquoted = new StringBuilder(scrubbed.Length);
+            for (var i = 0; i < scrubbed.Length; i++)
+            {
+                var c = scrubbed[i];
+                if (c != '"' && c != '\'') { unquoted.Append(c); continue; }
+                var j = i + 1;
+                while (j < scrubbed.Length && scrubbed[j] != c)
+                {
+                    if (c == '"' && scrubbed[j] == '\\' && j + 1 < scrubbed.Length) j++;
+                    j++;
+                }
+                if (j >= scrubbed.Length) return false; // 引号未闭合 → 不可判定
+                unquoted.Append(' ');
+                i = j;
+            }
+
+            // 2) 提取脚本块（平衡花括号）：从主文本剥离，单独校验
+            var blocks = new List<string>();
+            var main = new StringBuilder(unquoted.Length);
+            for (var i = 0; i < unquoted.Length; i++)
+            {
+                if (unquoted[i] != '{') { main.Append(unquoted[i]); continue; }
+                int depth = 0, start = i;
+                for (; i < unquoted.Length; i++)
+                {
+                    if (unquoted[i] == '{') depth++;
+                    else if (unquoted[i] == '}') { depth--; if (depth == 0) break; }
+                }
+                if (depth != 0) return false; // 花括号未闭合 → 不可判定
+                blocks.Add(unquoted.ToString(start, i - start + 1));
+            }
+
+            // 3) 主文本按管道分段校验（与 IsReadOnlyCommand 同规则，用扩展动词表）
+            foreach (var segment in main.ToString().Split(';', '\n'))
+            {
+                foreach (var partRaw in segment.Split('|'))
+                {
+                    var p = partRaw.Trim();
+                    if (p.Length == 0) continue;
+                    var tokens = System.Text.RegularExpressions.Regex.Matches(p, "[A-Za-z][A-Za-z]*-[A-Za-z]+");
+                    // 没有任何可识别 cmdlet、却含字母的片段 = 外部命令（cmd / del 等）→ 非低风险
+                    if (tokens.Count == 0 && System.Text.RegularExpressions.Regex.IsMatch(p, "[A-Za-z]")) return false;
+                    foreach (var token in tokens)
+                    {
+                        var t = token.ToString() ?? "";
+                        if (t.Length == 0) continue;
+                        if (PsWriteTokens.Any(w => t.StartsWith(w, StringComparison.OrdinalIgnoreCase))) return false;
+                        if (!LowRiskReadOnlyVerbs.Any(v => t.StartsWith(v, StringComparison.OrdinalIgnoreCase))) return false;
+                    }
+                }
+            }
+
+            // 4) 脚本块：允许属性访问/比较，拒绝写特征词（:: / 方法调用已在上面全局拒绝）
+            foreach (var b in blocks)
+                if (PsWriteTokens.Any(w => b.Contains(w, StringComparison.OrdinalIgnoreCase))) return false;
+
+            return true;
+        }
+        catch
+        {
+            return false; // 解析失败按非低风险处理
         }
     }
 
@@ -927,7 +1032,40 @@ public static class AgentTools
         catch { /* 单个文件读不了就跳过 */ }
     }
 
-    private static readonly Lazy<HttpClient> Http = new(() => new HttpClient { Timeout = TimeSpan.FromSeconds(20) });
+    // 浏览器样请求头：不少站点反爬见 UA 缺失/异常直接回「版本太低」拦截页；Cookie 容器处理首次响应种 cookie 放行
+    private static readonly Lazy<HttpClient> Http = new(() =>
+    {
+        var client = new HttpClient(new HttpClientHandler { UseCookies = true, CookieContainer = new CookieContainer() })
+        { Timeout = TimeSpan.FromSeconds(20) };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+        client.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+        client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("zh-CN,zh;q=0.9,en;q=0.8");
+        return client;
+    });
+
+    /// <summary>读取响应正文（带上限，防超大页面吃内存；内容最终会被截到 6000 字）。</summary>
+    private static async Task<string> ReadCappedAsync(HttpContent content, int maxBytes)
+    {
+        using var stream = await content.ReadAsStreamAsync();
+        using var ms = new MemoryStream();
+        var buf = new byte[8192];
+        long total = 0;
+        int n;
+        while ((n = await stream.ReadAsync(buf, 0, buf.Length)) > 0)
+        {
+            if (total + n > maxBytes) { ms.Write(buf, 0, (int)(maxBytes - total)); break; }
+            ms.Write(buf, 0, n);
+            total += n;
+        }
+        System.Text.Encoding enc = System.Text.Encoding.UTF8;
+        try
+        {
+            var cs = content.Headers.ContentType?.CharSet;
+            if (!string.IsNullOrWhiteSpace(cs)) enc = System.Text.Encoding.GetEncoding(cs);
+        }
+        catch { /* 未注册的字符集（如 GBK）回退 UTF-8 */ }
+        return enc.GetString(ms.ToArray());
+    }
 
     /// <summary>抓取网页正文转纯文本（仅 http/https，拒绝内网/本地地址防 SSRF）。</summary>
     private static async Task<string> WebFetch(string url)
@@ -939,7 +1077,7 @@ public static class AgentTools
         {
             using var resp = await Http.Value.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
             if (!resp.IsSuccessStatusCode) return "错误：HTTP " + (int)resp.StatusCode + "（" + uri.ToString() + "）";
-            var text = await resp.Content.ReadAsStringAsync();
+            var text = await ReadCappedAsync(resp.Content, 2 * 1024 * 1024); // 最多读 2MB
             var isHtml = (resp.Content.Headers.ContentType?.MediaType ?? "").Contains("html", StringComparison.OrdinalIgnoreCase);
             if (isHtml) text = HtmlToText(text);
             else
@@ -1108,8 +1246,11 @@ public static class PowerShellRunner
         return (code, output, timedOut);
     }
 
-    /// <summary>把命令编码为 -EncodedCommand 参数（Base64 UTF-16LE），彻底绕开命令行引号/反斜杠转义问题。</summary>
-    public static string ToEncodedCommand(string command) => Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(command));
+    /// <summary>把命令编码为 -EncodedCommand 参数（Base64 UTF-16LE），彻底绕开命令行引号/反斜杠转义问题。
+    /// 头部注入 $ProgressPreference='SilentlyContinue'：PS5.1 在 stdout 被重定向时，会把进度记录
+    /// （如"正在准备首次使用模块"）序列化成 CLIXML 块混进 stdout，抑制掉即可根治。</summary>
+    public static string ToEncodedCommand(string command) =>
+        Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes("$ProgressPreference='SilentlyContinue'; " + command));
 }
 
 /// <summary>后台 PowerShell 任务管理：启动即返回 job id，跨对话存活，硬上限到点强杀。</summary>

@@ -66,6 +66,9 @@ public sealed class ChatAgentConfig
     public ObservableCollection<string> TrustedDirs { get; set; } = new();
     /// <summary>observe_screen 工具捕获的屏幕（1-based 编号）；空列表=当前鼠标所在屏幕。</summary>
     public List<int> AgentScreens { get; set; } = new();
+
+    /// <summary>PowerShell 低风险命令自动放行策略：llm=只信 LLM 自评（risk=low 或 read_only=true，宽松但有风险）；dual=LLM 自评+宿主 IsLowRiskCommand 复核（推荐，默认）；off=不自动放行（只读命令一律确认）。路径范围规则不受此开关影响。</summary>
+    public string PsAutoPolicy { get; set; } = "dual";
 }
 
 public sealed class ProxyConfig
@@ -82,8 +85,9 @@ public sealed class ChatConfig
     public bool ReadInnerThoughts { get; set; } = false; // 是否朗读 （）() 和 【】 内的内心想法/小动作；false 时发送给 TTS 的文本剔除括号内容
     public ChatHotkeyConfig Hotkey { get; set; } = new();
     public ChatUiConfig Ui { get; set; } = new();
-    public int ContextLength { get; set; } = 20;
-    public int ContextMaxChars { get; set; } = 4000;
+    public int ContextLength { get; set; } = 80;
+    /// <summary>上下文预算（token）：历史 token 量达到它的 70% 触发摘要压缩；聊天窗标题栏实时显示占用比。本地模型(≤64k上下文)默认 16000 安全，外部大上下文 API 可调大。</summary>
+    public int ContextMaxTokens { get; set; } = 16000;
     public int ArchiveMaxEntries { get; set; } = 5000; // 归档记录上限（条），0=无上限
     public bool Proactive { get; set; } = false;
     public double ProactiveIntervalSec { get; set; } = 30.0;

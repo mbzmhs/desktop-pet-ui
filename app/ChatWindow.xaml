@@ -31,13 +31,17 @@
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <Ellipse Width="10" Height="10" Fill="#E0A0F0" Margin="0,0,6,0"/>
                     <TextBlock x:Name="TitleText" Text="聊天" FontSize="14" FontWeight="SemiBold"
                                Foreground="#DDD" VerticalAlignment="Center"/>
                 </StackPanel>
-                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+                <!-- 上下文占用（API usage.prompt_tokens / 设置里的 token 预算） -->
+                <TextBlock x:Name="UsageText" Grid.Column="1" FontSize="10.5" Foreground="#7A8"
+                           VerticalAlignment="Center" Margin="0,0,10,0" Visibility="Collapsed"/>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top">
                     <Button x:Name="MinBtn" Content="&#xE921;" FontFamily="Segoe MDL2 Assets" FontSize="10"
                             Click="OnMinimizeClick" WindowChrome.IsHitTestVisibleInChrome="True"
                             Background="Transparent" Foreground="#AAA" BorderThickness="0" Padding="9,5"/>
