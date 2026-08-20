@@ -61,7 +61,8 @@ public partial class ChatWindow : Window
     private string _streamShown = "";      // 气泡里已累计的显示文本（每片是"新释放部分"，必须追加而非替换）
     private FrameworkElement? _streamBubble; // 临时气泡元素（RebuildMessages 会清面板，需按需重挂）
     private TextBlock? _streamText;
-    private bool _streamFrozen;             // 被 [tool] 抑制/出错后冻结：保留已显示文本（去光标），等新流或历史重建替换
+    private bool _streamFrozen;             // 被 [tool] 抑制/出错后冻结：保留已显示文本（去光标），等正式版落历史替换
+    private DateTime _frozenTs;             // 冻结时刻：重建时按它参与时间戳排序，气泡停在正确位置而不是面板末尾
     private List<AgentOpRecord> _ops = new(); // agent 操作日志（磁盘加载 + 实时事件），仅 UI 线程读写
     private readonly HashSet<string> _expanded = new(); // 已展开的工具返回行（按消息全文为键，RebuildMessages 后状态不丢）
     private string? _opsChar;                 // 已加载操作日志所属角色（切换角色时自动重载）
@@ -339,6 +340,14 @@ public partial class ChatWindow : Window
             }
             items.Add((op.Ts, el));
         }
+        // 冻结气泡（[tool] 抑制/出错）：按冻结时刻参与排序，停在它本该在的位置（自动放行记录之前），
+        // 而不是临时挂到面板末尾；正式版 assistant 消息落历史后（Timestamp ≥ 冻结时刻）移除临时版
+        if (_streamFrozen && _streamBubble != null)
+        {
+            var replaced = history.Any(m => m.Role == "assistant" && m.Timestamp >= _frozenTs.AddSeconds(-1));
+            if (replaced) RemoveStreamBubble();
+            else items.Add((_frozenTs, _streamBubble!));
+        }
         // 稳定排序：时间戳相同（同一毫秒的工具往返）保持插入顺序
         var ordered = items.Select((it, i) => new { it.El, Ts = it.Ts, I = i })
                            .OrderBy(x => x.Ts).ThenBy(x => x.I)
@@ -349,8 +358,9 @@ public partial class ChatWindow : Window
             MsgPanel.Children.Add(_pendingConfirm.Card); // 未决确认卡片保持在消息流末尾
         if (_pendingAsk != null && !_pendingAsk.Resolved)
             MsgPanel.Children.Add(_pendingAsk.Card);     // 未决提问卡片同理
+        // 流式打字气泡=最新内容，保持在最末尾（Clear 后重挂）；冻结气泡在上面已按时间戳入 items 排好位
         if (_streamFilter != null && _streamBubble?.Parent == null)
-            MsgPanel.Children.Add(_streamBubble!);       // 流式打字气泡同样保持在最末尾（Clear 后重挂）
+            MsgPanel.Children.Add(_streamBubble!);
         if (scrollToEnd) ScrollToEnd();
     }
 
@@ -435,7 +445,7 @@ public partial class ChatWindow : Window
     }
 
     /// <summary>流结束（均触发）：completed=true 正常完成 → 移除临时气泡（正式版随后由历史重建）；
-    /// false 被 [tool] 抑制/出错/停止 → 冻结已显示文本（去光标）保留在面板上，避免"打到最后突然清空"，等工具往返落历史的重建或下一条新流替换。</summary>
+    /// false 被 [tool] 抑制/出错/停止 → 正文已完整，直接渲染成正式版 Markdown 气泡（记 _frozenTs 供重建排序归位），等工具往返落历史的重建或下一条新流替换。</summary>
     private void OnReplyStreamEnd(bool completed)
     {
         Dispatcher.BeginInvoke(new Action(() =>
@@ -451,7 +461,15 @@ public partial class ChatWindow : Window
             else if (_streamText != null)
             {
                 _streamFrozen = true;
-                _streamText.Text = _streamShown; // 去掉 ▍ 光标，冻结显示
+                _frozenTs = DateTime.Now; // 重建时按此时刻排序（早于同一步的自动放行记录）
+                // [tool] 后剩余全是隐藏 JSON，正文此刻已完整：直接换成 Markdown 渲染的正式版气泡
+                // （与工具执行完 OnMessage 落历史后的样式一致），不再保留纯文本冻结态
+                var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
+                if (_streamBubble != null && _streamBubble.Parent != null) MsgPanel.Children.Remove(_streamBubble);
+                var rendered = BuildBubble(false, name, _frozenTs, ToDisplay(_streamShown));
+                MsgPanel.Children.Add(rendered); // 重建时按 _frozenTs 归位；正式版落历史后由 replaced 检查移除
+                _streamBubble = rendered;
+                _streamText = null;
             }
             _streamFilter = null;
             _streamRaw = "";
@@ -850,6 +868,7 @@ public partial class ChatWindow : Window
         var text = InputBox.Text?.Trim();
         // 压缩期间输入框已禁用，这里再兜底一次（例如 Enter 事件先于 IsEnabled 生效的边界）
         if (string.IsNullOrEmpty(text) || _pipeline.IsRunning || _pipeline.IsCompressing) return;
+        RemoveStreamBubble(); // 清掉上一轮出错遗留的冻结气泡（[tool] 抑制的会由正式版落历史时自动移除）
         InputBox.Clear();
         _ = RunAsync(text);
     }
@@ -873,6 +892,9 @@ public partial class ChatWindow : Window
         StatusText.Text = msg;
         UpdateStopButton();
     }
+
+    /// <summary>清空状态栏（切换角色后清掉旧角色遗留的"已停止/出错"等提示，并刷新停止按钮）。</summary>
+    public void ResetStatus() => SetStatus("");
 
     /// <summary>运行中显示红色"停止"按钮；管线结束后隐藏（RunAsync 返回时也兜底刷新一次）。</summary>
     private void UpdateStopButton()

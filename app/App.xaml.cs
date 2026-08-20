@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Forms;
 using System.Windows.Interop;
@@ -339,10 +340,20 @@ public partial class App : System.Windows.Application
     public static void SwitchCharacter(string name)
     {
         if (Current is not App app) return;
-        app.SaveChatMemory();
-        PetWindow?.SetCharacter(name);
-        app.LoadChatMemory();
-        app._chatWindow?.RefreshCharacterTitle(); // 标题栏角色名 + Context 占用归零（等下次请求）
+        // 有进行中的聊天（流式/非流式）先终止并等本轮完全收尾：否则旧角色的回复/中断标记会
+        // 在 Restore 之后写进新角色的历史。收尾很快（取消 HTTP 即返回），仅长 TTS 播放时触顶超时。
+        _ = Task.Run(async () =>
+        {
+            await app._chatPipeline.StopAndWaitAsync();
+            app.Dispatcher.Invoke(() =>
+            {
+                app.SaveChatMemory();
+                PetWindow?.SetCharacter(name);
+                app.LoadChatMemory();
+                app._chatWindow?.RefreshCharacterTitle(); // 标题栏角色名 + Context 占用归零（等下次请求）
+                app._chatWindow?.ResetStatus(); // 清掉被中止的旧轮次遗留的"已停止/出错"状态
+            });
+        });
     }
 
     public static void RefreshAll()

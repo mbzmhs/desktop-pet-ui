@@ -67,6 +67,22 @@ public sealed class ChatPipeline : IDisposable
     /// <summary>手动停止当前运行：立即中止进行中的 LLM 请求/工具；用户发起的轮次会在历史留中断标记。不视为错误。</summary>
     public void Stop() => _runCts?.Cancel();
 
+    /// <summary>停止并等待本轮完全收尾（含历史写入与中断标记，gate 释放为界）。切换角色前调用：
+    /// 流式/非流式在途请求都会被 ct 中止，避免旧角色的回复/标记落到新角色的历史上。
+    /// 超时不阻塞（正常只在长 TTS 播放中会触顶，而那时历史已写完，无竞态）。</summary>
+    public async Task StopAndWaitAsync(int timeoutMs = 5000)
+    {
+        _runCts?.Cancel();
+        if (!IsRunning) return;
+        var got = false;
+        try
+        {
+            got = await _gate.WaitAsync(timeoutMs);
+        }
+        catch (TimeoutException) { /* 超时继续：见上说明，历史写入已完成在 gate 释放之前 */ }
+        if (got) _gate.Release(); // 只用作屏障，用完归还
+    }
+
     /// <summary>是否正在压缩历史（摘要 LLM 调用中）。</summary>
     public bool IsCompressing { get; private set; }
 
