@@ -104,6 +104,9 @@ public partial class App : System.Windows.Application
                 // 聊天窗可见时权限确认/提问在聊天窗内完成，否则回退宠物气泡
                 _window.ConfirmRedirect = req => _chatWindow!.TryShowConfirmAsync(req);
                 _window.AskRedirect = req => _chatWindow!.TryShowAskAsync(req);
+                // 新建 todo / 后台任务时自动弹出对应窗口（activate:false + ShowActivated=false → 不抢键盘焦点）
+                AgentTools.OnTodoCreated += () => Dispatcher.BeginInvoke(() => OpenTodoWindow(activate: false));
+                JobManager.OnJobStarted += () => Dispatcher.BeginInvoke(() => OpenJobWindow(activate: false));
                 _window.ChatRequested = () => Dispatcher.Invoke(() =>
                 {
                     _chatWindow?.ShowForInput();
@@ -272,7 +275,8 @@ public partial class App : System.Windows.Application
         _memoryWindow.Activate();
     }
 
-    private void OpenTodoWindow()
+    /// <summary>activate=false 供自动弹出路径（新建 todo/后台任务）：只显示不抢键盘焦点（XAML ShowActivated=false 兜底）。</summary>
+    private void OpenTodoWindow(bool activate = true)
     {
         if (_todoWindow == null)
         {
@@ -280,10 +284,10 @@ public partial class App : System.Windows.Application
             _todoWindow.Closed += (_, _) => _todoWindow = null;
         }
         _todoWindow.Show();
-        _todoWindow.Activate();
+        if (activate) _todoWindow.Activate();
     }
 
-    private void OpenJobWindow()
+    private void OpenJobWindow(bool activate = true)
     {
         if (_jobWindow == null)
         {
@@ -291,7 +295,7 @@ public partial class App : System.Windows.Application
             _jobWindow.Closed += (_, _) => _jobWindow = null;
         }
         _jobWindow.Show();
-        _jobWindow.Activate();
+        if (activate) _jobWindow.Activate();
     }
 
     /// <summary>聊天窗标题栏入口。</summary>
@@ -338,6 +342,7 @@ public partial class App : System.Windows.Application
         app.SaveChatMemory();
         PetWindow?.SetCharacter(name);
         app.LoadChatMemory();
+        app._chatWindow?.RefreshCharacterTitle(); // 标题栏角色名 + Context 占用归零（等下次请求）
     }
 
     public static void RefreshAll()

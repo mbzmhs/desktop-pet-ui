@@ -13,6 +13,8 @@ public sealed class AgentOpRecord
     public string Tool { get; set; } = "";
     /// <summary>动作短标题（如「删除（不可恢复）」）。</summary>
     public string Title { get; set; } = "";
+    /// <summary>模型说明的本次调用目的（一句话，角色语言；旧记录无此字段=空）。</summary>
+    public string Reason { get; set; } = "";
     /// <summary>操作详情全文（完整命令 / 路径，不截断）。</summary>
     public string Detail { get; set; } = "";
     /// <summary>裁定：auto=自动放行 allowed=用户允许 denied=用户拒绝。</summary>

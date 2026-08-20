@@ -22,6 +22,16 @@ namespace DesktopPetUi;
 public partial class JobWindow : Window
 {
     private readonly DispatcherTimer _timer;
+    private readonly Dictionary<string, CardRef> _cards = new(); // 每任务卡片缓存：内容没变就不重建元素（保住悬停 tooltip 的命中目标）
+    private TextBlock? _emptyHint;
+
+    private sealed class CardRef
+    {
+        public FrameworkElement Card = null!;
+        public TextBlock Elapsed = null!;
+        public string Sig = "";
+        public bool CmdExpanded; // 命令全文展开态（跨重建保留）
+    }
 
     public JobWindow()
     {
@@ -36,28 +46,84 @@ public partial class JobWindow : Window
     private void RefreshCore()
     {
         var jobs = JobManager.Snapshot();
-        JobPanel.Children.Clear();
         int running = 0, finished = 0;
+        var desired = new List<FrameworkElement>(jobs.Count);
         foreach (var j in jobs)
         {
             if (j.Running) running++; else finished++;
-            JobPanel.Children.Add(BuildCard(j));
+            // 签名=状态指纹：内容没变→复用旧元素（只原地更新耗时），变了才重建
+            var sig = j.Id + "|" + j.Running + "|" + j.ExitCode + "|" + j.TimedOut + "|" + j.Command.Length + "|" + j.Tail.Length;
+            if (j.Tail.Length > 0) sig += "|" + j.Tail[^Math.Min(64, j.Tail.Length)..].GetHashCode();
+
+            if (_cards.TryGetValue(j.Id, out var oldRef) && oldRef.Sig == sig)
+            {
+                UpdateElapsed(oldRef, j); // 运行中=跳动，已完成=按 EndedAt 冻结
+                desired.Add(oldRef.Card);
+                continue;
+            }
+            bool keepExpanded = false;
+            if (_cards.TryGetValue(j.Id, out var replaced))
+            {
+                keepExpanded = replaced.CmdExpanded; // 重建后保留命令展开态
+                JobPanel.Children.Remove(replaced.Card);
+            }
+            var (card, elapsed) = BuildCard(j, keepExpanded);
+            var @ref = new CardRef { Card = card, Elapsed = elapsed, Sig = sig, CmdExpanded = keepExpanded };
+            _cards[j.Id] = @ref;
+            desired.Add(card);
         }
+
+        // 已消失的任务（清除已完成后）移除卡片
+        foreach (var k in _cards.Keys.Where(k => jobs.All(x => x.Id != k)).ToList())
+        {
+            JobPanel.Children.Remove(_cards[k].Card);
+            _cards.Remove(k);
+        }
+
         if (jobs.Count == 0)
         {
-            JobPanel.Children.Add(new TextBlock
+            _emptyHint ??= new TextBlock
             {
                 Text = "暂无后台任务",
                 Foreground = new SolidColorBrush(Color.FromRgb(0x6A, 0x73, 0x85)),
                 FontSize = 12.5,
                 Margin = new Thickness(2)
-            });
+            };
+            SyncChildren(new List<FrameworkElement> { _emptyHint });
         }
+        else
+        {
+            if (_emptyHint != null && JobPanel.Children.Contains(_emptyHint)) JobPanel.Children.Remove(_emptyHint);
+            SyncChildren(desired);
+        }
+
         StatsText.Text = jobs.Count == 0 ? "" : running + " 运行中 / " + jobs.Count + " 总数";
         ClearBtn.Visibility = finished > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    private UIElement BuildCard(JobManager.JobSnapshot j)
+    /// <summary>按期望序列同步子元素：位置与引用都没变的不动（保住 hover 状态），差异位先 Remove 再 Insert
+    /// （UIElementCollection 的索引器 setter 不是替换语义，直接赋值会抛"索引已在使用"）。</summary>
+    private void SyncChildren(List<FrameworkElement> desired)
+    {
+        var n = Math.Min(desired.Count, JobPanel.Children.Count);
+        for (var k = 0; k < n; k++)
+            if (!ReferenceEquals(JobPanel.Children[k], desired[k]))
+            {
+                JobPanel.Children.RemoveAt(k);
+                JobPanel.Children.Insert(k, desired[k]); // 元素若还在集合别处会自动从旧位置摘出
+            }
+        while (JobPanel.Children.Count > desired.Count) JobPanel.Children.RemoveAt(JobPanel.Children.Count - 1);
+        while (JobPanel.Children.Count < desired.Count) JobPanel.Children.Add(desired[JobPanel.Children.Count]);
+    }
+
+    private static void UpdateElapsed(CardRef @ref, JobManager.JobSnapshot j)
+    {
+        var end = j.EndedAt ?? DateTime.Now; // 已完成任务按实际退出时刻冻结
+        var sec = Math.Max(0, (int)(end - j.StartedAt).TotalSeconds);
+        @ref.Elapsed.Text = (j.Running ? "已运行 " : "耗时 ") + FormatElapsed(sec);
+    }
+
+    private (FrameworkElement Card, TextBlock Elapsed) BuildCard(JobManager.JobSnapshot j, bool cmdExpanded)
     {
         var (stateText, stateBg) = j.Running
             ? ("运行中", "#3A7A4A")
@@ -78,7 +144,7 @@ public partial class JobWindow : Window
 
         var info = new StackPanel { Orientation = Orientation.Vertical };
 
-        // 第一行：id + 状态徽标 + 耗时
+        // 第一行：id + 任务名(reason) + 状态徽标 + 耗时
         var topRow = new StackPanel { Orientation = Orientation.Horizontal };
         topRow.Children.Add(new TextBlock
         {
@@ -86,6 +152,14 @@ public partial class JobWindow : Window
             Foreground = new SolidColorBrush(Color.FromRgb(0xE8, 0xEC, 0xF2)),
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 8, 0)
         });
+        if (!string.IsNullOrWhiteSpace(j.Name)) // 任务名=模型 reason（超长截断）
+            topRow.Children.Add(new TextBlock
+            {
+                Text = j.Name.Length > 40 ? j.Name[..40] + "…" : j.Name,
+                FontSize = 12, VerticalAlignment = VerticalAlignment.Center,
+                Foreground = new SolidColorBrush(Color.FromRgb(0xB8, 0xC0, 0xCC)),
+                Margin = new Thickness(0, 0, 8, 0),
+            });
         var badge = new Border
         {
             CornerRadius = new CornerRadius(9),
@@ -95,25 +169,71 @@ public partial class JobWindow : Window
         };
         badge.Child = new TextBlock { Text = stateText, FontSize = 11, Foreground = Brushes.White };
         topRow.Children.Add(badge);
-        var elapsed = FormatElapsed((int)(DateTime.Now - j.StartedAt).TotalSeconds);
-        topRow.Children.Add(new TextBlock
+        var elapsedText = new TextBlock
         {
-            Text = (j.Running ? "已运行 " : "耗时 ") + elapsed,
+            Text = "", // RefreshCore 首帧即填（运行中=跳动，已完成=按 EndedAt 冻结）
             FontSize = 11.5, Foreground = new SolidColorBrush(Color.FromRgb(0x8A, 0x93, 0xA6)),
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 0, 0)
-        });
+        };
+        UpdateElapsed(new CardRef { Elapsed = elapsedText }, j);
+        topRow.Children.Add(elapsedText);
         info.Children.Add(topRow);
 
-        // 第二行：命令（等宽，单行截断）
+        // 第二行：命令（等宽）。折叠态=像素级截断（TextTrimming 按窗口实际宽度省略，不依赖固定字符数）+
+        // 右侧始终可见的 ⌄ 展开箭头；展开态=全文换行 + ⌃ 收起。点击文字或箭头切换。
         if (!string.IsNullOrWhiteSpace(j.Command))
         {
-            info.Children.Add(new TextBlock
+            const int longCmdChars = 60; // 超过此长度才认为"需要展开"（短命令直接完整显示）
+            bool canToggle = j.Command.Length > longCmdChars;
+
+            var cmd = new TextBlock
             {
-                Text = j.Command.Length > 90 ? j.Command[..90] + "…" : j.Command,
                 FontFamily = new FontFamily("Consolas"), FontSize = 11.5,
                 Foreground = new SolidColorBrush(Color.FromRgb(0x9A, 0xA3, 0xAC)),
-                Margin = new Thickness(0, 5, 0, 0)
-            });
+                Margin = new Thickness(0, 5, 0, 0),
+            };
+            Action toggle = () =>
+            {
+                if (!_cards.TryGetValue(j.Id, out var r)) return;
+                r.CmdExpanded = !r.CmdExpanded;
+                r.Sig = ""; // 强制下一帧重建本卡（保留展开态）
+                RefreshCore();
+            };
+
+            if (cmdExpanded)
+            {
+                cmd.Text = j.Command + " ⌃";
+                cmd.TextWrapping = TextWrapping.Wrap;
+                cmd.Cursor = Cursors.Hand;
+                cmd.MouseLeftButtonUp += (_, _) => toggle();
+            }
+            else
+            {
+                var row = new DockPanel { LastChildFill = true };
+                if (canToggle)
+                {
+                    var arrow = new TextBlock
+                    {
+                        Text = " ⌄", FontSize = 12, Cursor = Cursors.Hand,
+                        Foreground = new SolidColorBrush(Color.FromRgb(0x7A, 0xA0, 0xC8)),
+                        VerticalAlignment = VerticalAlignment.Center,
+                    };
+                    arrow.MouseLeftButtonUp += (_, _) => toggle();
+                    DockPanel.SetDock(arrow, Dock.Right);
+                    row.Children.Add(arrow); // 先加右侧箭头，剩余宽度归命令文本
+                }
+                cmd.Text = j.Command;
+                cmd.TextWrapping = TextWrapping.NoWrap;
+                if (canToggle)
+                {
+                    cmd.TextTrimming = TextTrimming.CharacterEllipsis; // 按像素裁剪出"…"，任何窗口宽度下都可见
+                    cmd.Cursor = Cursors.Hand;
+                    cmd.MouseLeftButtonUp += (_, _) => toggle();
+                }
+                row.Children.Add(cmd);
+                info.Children.Add(row);
+            }
+            if (cmdExpanded) info.Children.Add(cmd);
         }
 
         // 第三行：输出末尾（暗底等宽小字，最多 4 行）
@@ -161,7 +281,7 @@ public partial class JobWindow : Window
         }
 
         card.Child = grid;
-        return card;
+        return (card, elapsedText);
     }
 
     private static string FormatElapsed(int sec)

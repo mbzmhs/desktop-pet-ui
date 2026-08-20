@@ -107,9 +107,13 @@ public sealed class AgentRunner
                                 + (call.RiskNote.Length > 0 ? "，" + Truncate(call.RiskNote, 60) : "") + "）" : "");
                         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 需要用户确认: " + question.Replace("\n", " ⏎ "));
                         var trustDir = AgentTools.TrustableDirFor(call, _config);
+                        // 标题 = reason（目的）· Title（动作），两者都要：reason 可能描述不全；只有一方时显示存在的一方
+                        var confirmTitle = string.IsNullOrWhiteSpace(call.Reason) ? call.Title
+                            : string.IsNullOrWhiteSpace(call.Title) ? call.Reason
+                                : call.Reason + " · " + call.Title;
                         var res = await host.ConfirmAsync(new ConfirmRequest
                         {
-                            Title = call.Title,
+                            Title = confirmTitle,
                             Detail = call.Detail,
                             Risk = call.Risk,
                             RiskNote = call.RiskNote,
@@ -134,6 +138,7 @@ public sealed class AgentRunner
                     {
                         Tool = call.Name,
                         Title = call.Title,
+                        Reason = call.Reason,
                         Detail = call.Detail,
                         Verdict = verdict,
                         Note = opNote,
@@ -142,7 +147,7 @@ public sealed class AgentRunner
                     if (feedback == null)
                     {
                         ct.ThrowIfCancellationRequested(); // 等确认期间用户点了停止 → 不执行工具
-                        var result = await AgentTools.ExecuteAsync(call.Name, call.Args, _config, host, ct);
+                        var result = await AgentTools.ExecuteAsync(call.Name, call.Args, _config, host, call.Reason, ct);
                         Log.Info("Agent result [" + call.Name + "]: " + EscapeForLog(Truncate(result.Text, 500)));
                         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 工具结果: " + Truncate(result.Text, 500).Replace("\n", " ⏎ "));
                         feedback = (trustNote != null ? "[note] " + trustNote + "\n" : "") + "[result] " + Truncate(result.Text, 2000);
@@ -186,13 +191,13 @@ public sealed class AgentRunner
         {
             if (JsonNode.Parse(jsonText)?.AsObject() is not { } obj)
             {
-                error = "工具调用 JSON 解析失败。请严格输出单行格式：[tool]{\"name\":\"工具名\",\"args\":{...}}[/tool]";
+                error = "工具调用 JSON 解析失败。请严格输出单行格式：" + SingleLineFormat;
                 return null;
             }
             var name = obj["name"]?.GetValue<string>()?.Trim() ?? "";
             if (string.IsNullOrWhiteSpace(name))
             {
-                error = "工具调用缺少 name 字段。请严格输出单行格式：[tool]{\"name\":\"工具名\",\"args\":{...}}[/tool]";
+                error = "工具调用缺少 name 字段。请严格输出单行格式：" + SingleLineFormat;
                 return null;
             }
             if (!AgentTools.Known(name))
@@ -203,11 +208,11 @@ public sealed class AgentRunner
             var args = obj["args"]?.AsObject();
             if (args == null)
             {
-                // 容错：模型有时把参数平铺在顶层而非 "args" 对象里，此时收集除 name/risk/risk_note 外的字段
+                // 容错：模型有时把参数平铺在顶层而非 "args" 对象里，此时收集除 name/reason/risk/risk_note 外的字段
                 args = new JsonObject();
                 foreach (var kv in obj)
                 {
-                    if (kv.Key is "name" or "risk" or "risk_note") continue;
+                    if (kv.Key is "name" or "reason" or "risk" or "risk_note") continue;
                     var node = kv.Value;
                     if (node == null) continue;
                     args[kv.Key] = JsonNode.Parse(node.ToJsonString());
@@ -220,12 +225,15 @@ public sealed class AgentRunner
                 call.Risk = (obj["risk"]?.ToString() ?? "").Trim().ToLowerInvariant();
                 if (call.Risk is not ("low" or "medium" or "high")) call.Risk = "";
                 call.RiskNote = (obj["risk_note"]?.ToString() ?? "").Trim();
+                // 本次调用目的（展示给用户：确认标题/提问卡标题/聊天窗工具行/审计记录）
+                var reason = (obj["reason"]?.ToString() ?? "").Trim();
+                call.Reason = reason.Length > 100 ? reason[..100] + "…" : reason;
             }
             return call;
         }
         catch
         {
-            error = "工具调用 JSON 解析失败。请严格输出单行格式：[tool]{\"name\":\"工具名\",\"args\":{...}}[/tool]";
+            error = "工具调用 JSON 解析失败。请严格输出单行格式：" + SingleLineFormat;
             return null;
         }
     }
@@ -248,7 +256,7 @@ public sealed class AgentRunner
         return result.Text;
     }
 
-    private const string SingleLineFormat = "[tool]{\"name\":\"工具名\",\"args\":{...}}[/tool]";
+    private const string SingleLineFormat = "[tool]{\"name\":\"工具名\",\"reason\":\"这一步的目的（一句话）\",\"args\":{...}}[/tool]";
 
     /// <summary>兜底：若强制收束后模型仍输出工具块，剥掉再返回。</summary>
     public static string StripToolBlocks(string s)

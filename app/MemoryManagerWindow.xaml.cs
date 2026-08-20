@@ -135,7 +135,7 @@ public partial class MemoryManagerWindow : Window
             {
                 VerdictText = verdictText,
                 BadgeColor = badgeColor,
-                ToolLabel = op.Tool + (string.IsNullOrWhiteSpace(op.Title) ? "" : " · " + op.Title),
+                ToolLabel = op.Tool + (string.IsNullOrWhiteSpace(op.Reason) ? "" : " · " + op.Reason),
                 Time = op.Ts.Year >= 2000 ? op.Ts.ToString("MM-dd HH:mm:ss") : "",
                 Detail = string.IsNullOrWhiteSpace(op.Detail) ? op.Title : op.Detail,
                 NoteLine = note.Length > 0 ? ("备注：" + note) : "",

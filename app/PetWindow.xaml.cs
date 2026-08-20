@@ -908,7 +908,17 @@ public partial class PetWindow : Window, ISpeakHost
     private void ShowAskChrome(AskRequest req)
     {
         BeginDialogChrome();
-        BubbleTitleRow.Visibility = Visibility.Collapsed;
+        // reason 作标题（模型说明的提问目的），无则纯文本布局
+        if (!string.IsNullOrWhiteSpace(req.Title))
+        {
+            BubbleTitleRow.Visibility = Visibility.Visible;
+            BubbleTitle.Text = CapText(req.Title, 120);
+            ApplyRiskBadge("", ""); // 清掉上一轮确认残留的徽标
+        }
+        else
+        {
+            BubbleTitleRow.Visibility = Visibility.Collapsed;
+        }
         BubbleRiskNote.Visibility = Visibility.Collapsed;
         BubbleDetailBox.Visibility = Visibility.Collapsed;
 

@@ -37,6 +37,8 @@ public sealed class ParsedToolCall
     public string Detail = "";
     /// <summary>确认气泡里展示给用户的操作描述（Title+Detail 摘要，用于日志）。</summary>
     public string Description = "";
+    /// <summary>模型说明的本次调用目的（一句话，角色语言；展示给用户：确认/提问标题、聊天窗工具行、审计记录）。</summary>
+    public string Reason = "";
     /// <summary>模型自评危险等级：low/medium/high（空=未提供）。仅作参考，宿主分级为准；high 时会升级为确认。</summary>
     public string Risk = "";
     /// <summary>模型对风险的一句话说明（展示用）。</summary>
@@ -55,6 +57,9 @@ public static class AgentTools
     private const int SearchMaxDepth = 8;      // search_files 递归深度上限
     internal const int JobBufferCap = 16_000;   // 后台任务输出环形缓冲上限
     internal const int JobHistoryCap = 20;      // 保留的已完成任务数
+
+    /// <summary>新建 todo 条目后触发（宿主用于自动弹出 Todo 窗口；后台线程回调，UI 侧自行切线程）。</summary>
+    public static Action? OnTodoCreated;
 
     /// <summary>写操作特征：命中任意一条即视为非只读（宁可多问，不可误放）。</summary>
     private static readonly string[] PsWriteTokens =
@@ -736,8 +741,8 @@ public static class AgentTools
         return list;
     }
 
-    /// <summary>执行工具，返回回填给模型的结果（错误也以文本形式返回，让模型自行调整）。host 供 ask_user 使用；ct 取消时 run_powershell 立即杀进程。</summary>
-    public static async Task<ToolResult> ExecuteAsync(string name, JsonObject args, AppConfig cfg, ISpeakHost? host = null, CancellationToken ct = default)
+    /// <summary>执行工具，返回回填给模型的结果（错误也以文本形式返回，让模型自行调整）。host 供 ask_user 使用；reason 为模型说明的调用目的（展示给用户）；ct 取消时 run_powershell 立即杀进程。</summary>
+    public static async Task<ToolResult> ExecuteAsync(string name, JsonObject args, AppConfig cfg, ISpeakHost? host = null, string reason = "", CancellationToken ct = default)
     {
         var agent = cfg.Chat.Agent;
         try
@@ -759,14 +764,14 @@ public static class AgentTools
                 case "web_fetch": return await WebFetch(arg(args, "url"));
                 case "run_powershell":
                     return await Task.Run(() => RunPowerShellSync(arg(args, "command"), agent.PsTimeoutSec, cfg, ct), ct);
-                case "start_powershell": return JobManager.Start(arg(args, "command"), cfg);
+                case "start_powershell": return JobManager.Start(arg(args, "command"), cfg, reason); // 任务名=reason
                 case "check_job": return JobManager.Check(arg(args, "job_id"));
                 case "todo": return TodoAction(arg(args, "action"), args, cfg);
                 case "ask_user":
                     if (host == null) return "错误：当前环境不支持向用户提问";
                     var askQs = ParseAskQuestions(args);
                     if (askQs == null) return "错误：question 不能为空";
-                    var r = await host.AskUserAsync(new AskRequest { Questions = askQs });
+                    var r = await host.AskUserAsync(new AskRequest { Title = reason, Questions = askQs }); // reason 作为提问卡标题
                     var ansSb = new StringBuilder();
                     int answeredCount = 0;
                     for (var i = 0; i < askQs.Count; i++)
@@ -805,6 +810,7 @@ public static class AgentTools
                 var text = arg(args, "text");
                 if (string.IsNullOrWhiteSpace(text)) return "错误：add 需要非空的 text";
                 var added = TodoStore.Add(cfg, text);
+                try { OnTodoCreated?.Invoke(); } catch { } // 宿主自动弹出 Todo 窗口（ShowActivated=false，不抢焦点）
                 return "Todo 列表已更新：\n" + TodoStore.Render(added) + "\n（完成某项时用 action=done、id=对应编号）";
             case "done":
             case "undone":
@@ -1383,6 +1389,8 @@ public static class PowerShellRunner
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8, // 与 ToEncodedCommand 前缀的 UTF-8 输出配对（中文不乱码）
+            StandardErrorEncoding = Encoding.UTF8,
             CreateNoWindow = true,
         };
         var sbOut = new StringBuilder();
@@ -1393,8 +1401,10 @@ public static class PowerShellRunner
         using var cancelReg = ct.Register(() => { try { proc.Kill(entireProcessTree: true); } catch { } });
         var doneOut = new TaskCompletionSource();
         var doneErr = new TaskCompletionSource();
-        proc.OutputDataReceived += (_, e) => { if (e.Data != null) lock (sbOut) sbOut.AppendLine(e.Data); else doneOut.TrySetResult(); };
-        proc.ErrorDataReceived += (_, e) => { if (e.Data != null) lock (sbErr) sbErr.AppendLine(e.Data); else doneErr.TrySetResult(); };
+        var fOut = new ClixmlFilter(); // stdout/stderr 各一个有状态过滤器（CLIXML 块可能跨多行）
+        var fErr = new ClixmlFilter();
+        proc.OutputDataReceived += (_, e) => { if (e.Data != null) { var l = fOut.Filter(e.Data); if (l != null) lock (sbOut) sbOut.AppendLine(l); } else doneOut.TrySetResult(); };
+        proc.ErrorDataReceived += (_, e) => { if (e.Data != null) { var l = fErr.Filter(e.Data); if (l != null) lock (sbErr) sbErr.AppendLine(l); } else doneErr.TrySetResult(); };
         proc.BeginOutputReadLine();
         proc.BeginErrorReadLine();
 
@@ -1419,11 +1429,73 @@ public static class PowerShellRunner
         return (code, output, timedOut, ct.IsCancellationRequested);
     }
 
-    /// <summary>把命令编码为 -EncodedCommand 参数（Base64 UTF-16LE），彻底绕开命令行引号/反斜杠转义问题。
-    /// 头部注入 $ProgressPreference='SilentlyContinue'：PS5.1 在 stdout 被重定向时，会把进度记录
-    /// （如"正在准备首次使用模块"）序列化成 CLIXML 块混进 stdout，抑制掉即可根治。</summary>
+    /// <summary>每条命令的固定前缀：
+    /// ① $ProgressPreference='SilentlyContinue' —— PS5.1 在 stdout 被重定向时，会把进度记录
+    /// （如"正在准备首次使用模块"）序列化成 CLIXML 块混进 stdout，抑制掉即可根治；
+    /// ② 强制输出编码 UTF-8（[Console]::OutputEncoding + $OutputEncoding），与宿主侧
+    /// StandardOutputEncoding=UTF8 配对，根治中文输出乱码（try/catch 防个别句柄设置失败）。</summary>
+    private const string Preamble = "$ProgressPreference='SilentlyContinue'; try{[Console]::OutputEncoding=[System.Text.Encoding]::UTF8}catch{}; $OutputEncoding=[System.Text.Encoding]::UTF8; ";
+
+    /// <summary>把命令编码为 -EncodedCommand 参数（Base64 UTF-16LE），彻底绕开命令行引号/反斜杠转义问题。</summary>
     public static string ToEncodedCommand(string command) =>
-        Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes("$ProgressPreference='SilentlyContinue'; " + command));
+        Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(Preamble + command));
+
+    /// <summary>逐行过滤 CLIXML 序列化块（有状态，每个输出流一个实例）。PS5.1 重定向时错误块形如：
+    /// 第一行字面量标记 "#&lt; CLIXML"，随后是 &lt;Objs…&gt; XML（可能跨多行）。
+    /// 标记行吞掉、块内行吞掉、含 &lt;/Objs&gt; 的收尾行走 SanitizeLine 提取可读错误；
+    /// 连续吞 20 行仍未见收尾则放弃过滤恢复正常透传（防异常块卡死后续输出）。</summary>
+    public sealed class ClixmlFilter
+    {
+        private bool _inBlock;
+        private int _swallowed;
+
+        /// <summary>返回 null=该行丢弃；否则返回（可能被净化的）行文本。</summary>
+        public string? Filter(string line)
+        {
+            if (_inBlock)
+            {
+                if (line.Contains("</Objs>", StringComparison.Ordinal))
+                {
+                    _inBlock = false;
+                    return SanitizeLine(line);
+                }
+                if (++_swallowed > 20) // 收尾一直没来：停止吞行，后续按普通输出透传
+                {
+                    _inBlock = false;
+                    return SanitizeLine(line);
+                }
+                return null;
+            }
+            if (line.TrimStart().StartsWith("#< CLIXML", StringComparison.Ordinal))
+            {
+                _inBlock = true;
+                _swallowed = 0;
+                return null; // 标记行本身丢弃
+            }
+            return line;
+        }
+    }
+
+    /// <summary>净化单行输出：PS5.1 在 stdout/stderr 被重定向时，会把 ErrorRecord（Write-Error/未捕获异常）
+    /// 序列化成 &lt;Objs…&gt; CLIXML 块。这里从中提取人类可读的错误文本（Message/ToString），
+    /// 提不出就整行替换为占位说明，避免把 XML 噪声喂给模型或展示给用户。</summary>
+    public static string SanitizeLine(string line)
+    {
+        if (!line.Contains("<Objs")) return line;
+        var parts = new List<string>();
+        foreach (System.Text.RegularExpressions.Match mm in System.Text.RegularExpressions.Regex.Matches(line, "<S(?:\\s[^>]*)?>([^<]+)</S>|<ToString>([^<]+)</ToString>"))
+        {
+            var s = (mm.Groups[1].Success ? mm.Groups[1].Value : mm.Groups[2].Value).Trim();
+            if (s.Length == 0) continue;
+            // 过滤 CLIXML 里的技术性内容：.NET 类型名、GUID、纯数字
+            if (s.StartsWith("System.", StringComparison.Ordinal) || s.Contains(".Management.")) continue;
+            if (System.Guid.TryParse(s, out _)) continue;
+            if (s.All(char.IsDigit) || (s.Length > 8 && s.All(c => char.IsDigit(c) || c == '-' || c == '+'))) continue;
+            if (!parts.Contains(s)) parts.Add(s);
+        }
+        var readable = System.Net.WebUtility.HtmlDecode(string.Join(" | ", parts));
+        return readable.Length > 0 ? "错误：" + readable : "（错误输出为 PowerShell 内部序列化数据，已省略）";
+    }
 }
 
 /// <summary>后台 PowerShell 任务管理：启动即返回 job id，跨对话存活，硬上限到点强杀。</summary>
@@ -1432,6 +1504,7 @@ public sealed class JobManager
     private sealed class JobState
     {
         public string Id = "";
+        public string Name = ""; // 任务名（模型 reason，展示用；空=只显示 id）
         public string Command = "";
         public DateTime StartedAt = DateTime.Now;
         public Process? Proc;
@@ -1440,17 +1513,21 @@ public sealed class JobManager
         public int? ExitCode;
         public bool TimedOut;
         public long ReadPos; // check_job 已读位置（增量返回）
+        public PowerShellRunner.ClixmlFilter FilterOut = new(); // stdout/stderr 各一个 CLIXML 过滤器
+        public PowerShellRunner.ClixmlFilter FilterErr = new();
     }
 
     /// <summary>任务快照（后台任务管理器窗口展示用，线程安全拷贝）。</summary>
     public sealed class JobSnapshot
     {
         public string Id = "";
+        public string Name = ""; // 任务名（模型 reason，展示用；空=只显示 id）
         public string Command = "";
         public DateTime StartedAt;
         public bool Running;
         public int? ExitCode;
         public bool TimedOut;
+        public DateTime? EndedAt; // 进程实际退出时刻（已完成任务的耗时按它冻结，不再随刷新增长）
         public string Tail = ""; // 输出末尾（锁内截取）
     }
 
@@ -1458,7 +1535,11 @@ public sealed class JobManager
     private static readonly object Gate = new();
     private static int _seq;
 
-    public static string Start(string command, AppConfig cfg)
+    /// <summary>新后台任务启动后触发（宿主用于自动弹出任务窗口；后台线程回调，UI 侧自行切线程）。</summary>
+    public static Action? OnJobStarted;
+
+    /// <param name="name">任务名（模型的 reason，展示用；空=只显示 job id）。</param>
+    public static string Start(string command, AppConfig cfg, string name = "")
     {
         if (string.IsNullOrWhiteSpace(command)) return "错误：command 不能为空";
         var agent = cfg.Chat.Agent;
@@ -1470,7 +1551,9 @@ public sealed class JobManager
         }
 
         var id = "job_" + Interlocked.Increment(ref _seq);
-        var job = new JobState { Id = id, Command = command };
+        name = (name ?? "").Trim();
+        if (name.Length > 60) name = name[..60] + "…";
+        var job = new JobState { Id = id, Command = command, Name = name };
         var psi = new ProcessStartInfo
         {
             FileName = "powershell.exe",
@@ -1479,6 +1562,8 @@ public sealed class JobManager
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8, // 与 ToEncodedCommand 前缀的 UTF-8 输出配对（中文不乱码）
+            StandardErrorEncoding = Encoding.UTF8,
             CreateNoWindow = true,
         };
         try
@@ -1489,13 +1574,14 @@ public sealed class JobManager
         {
             return "错误：启动失败 " + ex.Message;
         }
-        job.Proc!.OutputDataReceived += (_, e) => Append(job, e.Data);
-        job.Proc.ErrorDataReceived += (_, e) => Append(job, "[stderr] " + e.Data);
+        job.Proc!.OutputDataReceived += (_, e) => { if (e.Data != null) { var l = job.FilterOut.Filter(e.Data); if (l != null) Append(job, l); } };
+        job.Proc.ErrorDataReceived += (_, e) => { if (e.Data != null) { var l = job.FilterErr.Filter(e.Data); if (l != null) Append(job, "[stderr] " + l); } };
         job.Proc.BeginOutputReadLine();
         job.Proc.BeginErrorReadLine();
 
         lock (Gate) Jobs[id] = job;
         Watchdog(job, Math.Max(1.0, agent.JobMaxMinutes));
+        try { OnJobStarted?.Invoke(); } catch { } // 宿主自动弹出任务窗口（失败不影响任务本身）
         return id + " 已启动（预计超过 1 分钟的任务请用 check_job 查询进度）";
     }
 
@@ -1504,7 +1590,7 @@ public sealed class JobManager
         if (line == null) return;
         lock (job.Lock)
         {
-            job.Buf.AppendLine(line);
+            job.Buf.AppendLine(PowerShellRunner.SanitizeLine(line));
             if (job.Buf.Length > AgentTools.JobBufferCap)
                 job.Buf.Remove(0, job.Buf.Length / 2); // 丢最旧的一半，保留近期输出
         }
@@ -1623,14 +1709,22 @@ public sealed class JobManager
                     var from = Math.Max(0, j.Buf.Length - 500);
                     tail = j.Buf.ToString(from, j.Buf.Length - from).Trim();
                 }
+                DateTime? ended = null;
+                if (exited)
+                {
+                    try { if (proc != null) ended = proc.ExitTime; } catch { }
+                    ended ??= DateTime.Now; // ExitTime 取不到时兜底（此后每帧都是新值，仅此一帧偏差）
+                }
                 list.Add(new JobSnapshot
                 {
                     Id = j.Id,
+                    Name = j.Name,
                     Command = j.Command,
                     StartedAt = j.StartedAt,
                     Running = !exited,
                     ExitCode = code,
                     TimedOut = j.TimedOut,
+                    EndedAt = ended,
                     Tail = tail,
                 });
             }

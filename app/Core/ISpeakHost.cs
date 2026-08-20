@@ -54,6 +54,8 @@ public sealed class AskQuestion
 
 public sealed class AskRequest
 {
+    /// <summary>本次提问的目的（模型 reason，角色语言）：作为提问卡/气泡标题；空=用默认文案。</summary>
+    public string Title { get; set; } = "";
     public List<AskQuestion> Questions { get; set; } = new();
 }
 

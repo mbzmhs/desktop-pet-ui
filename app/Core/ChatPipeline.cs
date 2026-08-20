@@ -137,6 +137,7 @@ public sealed class ChatPipeline : IDisposable
             _history.AddRange(Sanitize(history));
         }
         _summary = string.IsNullOrWhiteSpace(summary) ? null : summary;
+        _lastPromptTokens = 0; // 换角色/重置后上下文占用归零：标题栏隐藏 Context 显示，直到下一次请求拿到真实 usage
         HistoryChanged?.Invoke();
     }
 
@@ -198,11 +199,8 @@ public sealed class ChatPipeline : IDisposable
         // —— 易变尾部（每轮变化，放最后以最小化缓存失效范围）——
         if (_config.Chat.Agent.Enabled)
         {
-            JobManager.Prune();
-            var jobLine = JobManager.ActiveSummary();
-            if (!string.IsNullOrWhiteSpace(jobLine)) parts.Add(jobLine);
-            var todoLine = TodoStore.SummaryLine(_config);
-            if (!string.IsNullOrWhiteSpace(todoLine)) parts.Add(todoLine);
+            JobManager.Prune(); // 仅清理
+            // [ACTIVE JOBS]/[TODO] 摘要都不再注入：状态每轮都可能变，会击穿前缀缓存；模型需要时自己用工具查（check_job / todo 工具）
         }
         // 只到日期（不带时分）：时分每轮都变，会击穿前缀缓存；模型需要精确时间时会自己问/用工具查
         var now = DateTime.Now;
@@ -216,9 +214,10 @@ public sealed class ChatPipeline : IDisposable
         return "[AGENT MODE] You can operate this computer on the user's behalf via tools. " +
                "CURRENT STATE: agent mode is ENABLED right now — if any earlier message says tools/the Agent are disabled or unavailable, that is stale (the setting was off at the time); ignore it and call tools normally.\n" +
                "PROTOCOL (follow EXACTLY):\n" +
-                "- To call a tool, put ONE line in your reply: [tool]{\"name\":\"tool_name\",\"risk\":\"low|medium|high\",\"args\":{...}}[/tool] — at most ONE [tool] line per reply. You may add one short in-character sentence about what you are doing, then WAIT for the [result] message before continuing.\n" +
-                "- A reply WITHOUT a [tool] line ENDS the task. Therefore: if you still need to do anything (search, read, run, create...), this reply MUST contain the [tool] line — NEVER just say \"let me look/try/check\" and stop without calling the tool. Reserve tool-free replies for final answers or when no action is needed.\n" +
-                "- Example: [tool]{\"name\":\"list_dir\",\"risk\":\"low\",\"args\":{\"path\":\"C:\\\\Users\\\\me\\\\Desktop\"}}[/tool]\n" +
+                 "- To call a tool, put ONE line in your reply: [tool]{\"name\":\"tool_name\",\"reason\":\"...\",\"risk\":\"low|medium|high\",\"args\":{...}}[/tool] — at most ONE [tool] line per reply. You may add one short in-character sentence about what you are doing, then WAIT for the [result] message before continuing.\n" +
+                 "- EVERY call MUST include \"reason\": ONE short sentence explaining WHY this step is needed (the user sees it verbatim as the action's title). Write it in the same language you use for replies (see the LANGUAGE section above); keep it under 30 words; never repeat the command/path itself — the system already shows that.\n" +
+                 "- A reply WITHOUT a [tool] line ENDS the task. Therefore: if you still need to do anything (search, read, run, create...), this reply MUST contain the [tool] line — NEVER just say \"let me look/try/check\" and stop without calling the tool. Reserve tool-free replies for final answers or when no action is needed.\n" +
+                 "- Example: [tool]{\"name\":\"list_dir\",\"reason\":\"see what files are on the desktop\",\"risk\":\"low\",\"args\":{\"path\":\"C:\\\\Users\\\\me\\\\Desktop\"}}[/tool]\n" +
                 "- NEVER put tool parameters (command, path, url, ...) at the top level. ALL parameters MUST go inside the \"args\" object. WRONG: {\"name\":\"run_powershell\",\"command\":\"dir\"}. RIGHT: {\"name\":\"run_powershell\",\"risk\":\"low\",\"args\":{\"command\":\"dir\",\"read_only\":true}}\n" +
                 "- risk = your self-assessed danger level: low=read-only/no side effect, medium=creating new content, high=delete/overwrite/irreversible. When in doubt, rate HIGHER. The system grades independently and may ask the user to confirm; if the user declines, do NOT retry.\n" +
                "- Do not use tools for plain conversation.\n" +

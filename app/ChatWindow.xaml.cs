@@ -54,6 +54,7 @@ public partial class ChatWindow : Window
     private ConfirmCard? _pendingConfirm;
     private AskCard? _pendingAsk;
     private List<AgentOpRecord> _ops = new(); // agent 操作日志（磁盘加载 + 实时事件），仅 UI 线程读写
+    private readonly HashSet<string> _expanded = new(); // 已展开的工具返回行（按消息全文为键，RebuildMessages 后状态不丢）
     private string? _opsChar;                 // 已加载操作日志所属角色（切换角色时自动重载）
 
     public ChatWindow(AppConfig config, ChatPipeline pipeline, Func<Rect?> petRect)
@@ -88,13 +89,21 @@ public partial class ChatWindow : Window
         }
 
         _pipeline.Status = SetStatus;
-        _pipeline.HistoryChanged += RebuildMessages;
+        _pipeline.HistoryChanged += () => RebuildMessages();
         _pipeline.OpAdded += OnOpAdded;
         _pipeline.UsageChanged += () => Dispatcher.Invoke(UpdateUsageLabel); // usage 在后台线程更新
         _pipeline.CompressingChanged += v => Dispatcher.Invoke(() => OnCompressing(v)); // 压缩期间提示+锁定输入
         SizeChanged += (s, e) => SaveLayout(); // 拖角缩放后落盘
         TitleText.Text = "和" + (string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName) + "聊天";
         RebuildMessages();
+    }
+
+    /// <summary>切换角色后刷新标题栏：角色名 + Context 占用（新角色尚无 usage 时自动隐藏，等下次请求结果）。</summary>
+    public void RefreshCharacterTitle()
+    {
+        if (!Dispatcher.CheckAccess()) { Dispatcher.Invoke(RefreshCharacterTitle); return; }
+        TitleText.Text = "和" + (string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName) + "聊天";
+        UpdateUsageLabel(); // Restore 已把 LastPromptTokens 归零 → used<=0 时隐藏标签
     }
 
     /// <summary>显示并聚焦（位置使用记忆值，不再跟随宠物）。</summary>
@@ -218,11 +227,12 @@ public partial class ChatWindow : Window
 
     // ---------------- 消息流 ----------------
 
-    private void RebuildMessages()
+    /// <param name="scrollToEnd">false=原地重建（如点击展开/收起工具返回），不滚动到最底部。</param>
+    private void RebuildMessages(bool scrollToEnd = true)
     {
         if (!Dispatcher.CheckAccess())
         {
-            Dispatcher.BeginInvoke(new Action(RebuildMessages));
+            Dispatcher.BeginInvoke(new Action(() => RebuildMessages(scrollToEnd)));
             return;
         }
         var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
@@ -262,7 +272,7 @@ public partial class ChatWindow : Window
             MsgPanel.Children.Add(_pendingConfirm.Card); // 未决确认卡片保持在消息流末尾
         if (_pendingAsk != null && !_pendingAsk.Resolved)
             MsgPanel.Children.Add(_pendingAsk.Card);     // 未决提问卡片同理
-        ScrollToEnd();
+        if (scrollToEnd) ScrollToEnd();
     }
 
     /// <summary>剥离情绪标签（内置 + TTS 自定义），避免 [happy] 之类出现在显示文本里。</summary>
@@ -525,8 +535,11 @@ public partial class ChatWindow : Window
 
         inner.Children.Add(new TextBlock
         {
-            Text = req.Questions.Count > 1 ? "有 " + req.Questions.Count + " 个问题需要你确认" : "想问你一个问题",
-            FontWeight = FontWeights.SemiBold, FontSize = 14, Foreground = MakeBrush("#EEE"),
+            // 有 reason 时以它作标题（模型说明的提问目的），否则默认文案
+            Text = string.IsNullOrWhiteSpace(req.Title)
+                ? (req.Questions.Count > 1 ? "有 " + req.Questions.Count + " 个问题需要你确认" : "想问你一个问题")
+                : CapText(req.Title, 120),
+            FontWeight = FontWeights.SemiBold, FontSize = 14, Foreground = MakeBrush("#EEE"), TextWrapping = TextWrapping.Wrap,
         });
 
         for (var i = 0; i < req.Questions.Count; i++)
@@ -745,16 +758,18 @@ public partial class ChatWindow : Window
             || c.StartsWith("[system]", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>工具往返紧凑行：小字号等宽、低对比，贴在消息流里不喧宾夺主。</summary>
+    /// <summary>工具往返紧凑行：小字号等宽、低对比，贴在消息流里不喧宾夺主。
+    /// [result]/[error] 超长内容默认折叠，点击展开全文（opencode 式），再点收起；展开状态按消息全文记在 _expanded 里，重建后不丢。</summary>
     private FrameworkElement BuildExchangeLine(ChatMessage m)
     {
         var c = (m.Content ?? "").Trim();
         string prefix, text;
+        bool expandable = false;
         if (m.Role == "user")
         {
             if (c.StartsWith("[note]", StringComparison.OrdinalIgnoreCase)) { prefix = "◈"; text = c.Substring(6).Trim(); }
-            else if (c.StartsWith("[error]", StringComparison.OrdinalIgnoreCase)) { prefix = "!"; text = c.Substring(7).Trim(); }
-            else if (c.StartsWith("[result]", StringComparison.OrdinalIgnoreCase)) { prefix = "↩"; text = c.Substring(8).Trim(); }
+            else if (c.StartsWith("[error]", StringComparison.OrdinalIgnoreCase)) { prefix = "!"; text = c.Substring(7).Trim(); expandable = true; }
+            else if (c.StartsWith("[result]", StringComparison.OrdinalIgnoreCase)) { prefix = "↩"; text = c.Substring(8).Trim(); expandable = true; }
             else { prefix = "↩"; text = c; }
         }
         else if (c.StartsWith("[system]", StringComparison.OrdinalIgnoreCase))
@@ -764,13 +779,21 @@ public partial class ChatWindow : Window
         }
         else
         {
+            // 工具调用行：name · reason（模型说明的这一步目的），一眼看出每步在干什么
             var nm = Regex.Match(c, "\"name\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase);
             prefix = "⚙";
             text = nm.Success ? nm.Groups[1].Value : c;
+            var rm = Regex.Match(c, "\"reason\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase);
+            if (rm.Success && !string.IsNullOrWhiteSpace(rm.Groups[1].Value))
+                text += " · " + rm.Groups[1].Value;
         }
-        return new TextBlock
+
+        const int collapsedLen = 120;
+        var expanded = _expanded.Contains(c);
+        bool showAll = !expandable || text.Length <= collapsedLen || expanded;
+
+        var tb = new TextBlock
         {
-            Text = prefix + " " + CapText(text, 120).Replace("\n", " ⏎ "),
             FontFamily = new FontFamily("Consolas"),
             FontSize = 11,
             Foreground = MakeBrush(m.Role == "user" ? "#667080" : "#8A93A0"),
@@ -779,6 +802,32 @@ public partial class ChatWindow : Window
             TextWrapping = TextWrapping.Wrap,
             Margin = new Thickness(0, 1, 0, 1),
         };
+        if (showAll)
+        {
+            tb.Text = prefix + " " + text;
+            if (expandable && text.Length > collapsedLen && expanded)
+            {
+                tb.Text += "\n⌃ 点击收起";
+                tb.Cursor = Cursors.Hand;
+                tb.MouseLeftButtonUp += (_, _) =>
+                {
+                    _expanded.Remove(c);
+                    RebuildMessages(scrollToEnd: false); // 原地切换，不跳底
+                };
+            }
+        }
+        else
+        {
+            // 折叠态：截断 + 展开提示，点击切换
+            tb.Text = prefix + " " + CapText(text, collapsedLen).Replace("\n", " ⏎ ") + " ⌄ 点击展开";
+            tb.Cursor = Cursors.Hand;
+            tb.MouseLeftButtonUp += (_, _) =>
+            {
+                _expanded.Add(c);
+                RebuildMessages(scrollToEnd: false); // 原地切换，不跳底
+            };
+        }
+        return tb;
     }
 
     /// <summary>agent 操作记录行（区别于对话气泡）：裁定徽标 + 等宽命令详情 + 时间戳，灰底小卡。</summary>
@@ -809,9 +858,13 @@ public partial class ChatWindow : Window
         badge.Child = new TextBlock { Text = badgeText + note, FontSize = 11.5, Foreground = Brushes.White };
         Grid.SetColumn(badge, 0);
 
+        // 行文本：reason（目的）· Title（动作）· detail（详情），缺哪项省哪项
+        var lineText = (string.IsNullOrWhiteSpace(op.Reason) ? "" : CapText(op.Reason, 80) + " · ")
+                     + (string.IsNullOrWhiteSpace(op.Title) ? "" : op.Title + " · ")
+                     + detail;
         var detailText = new TextBlock
         {
-            Text = (string.IsNullOrWhiteSpace(op.Title) ? "" : op.Title + " · ") + detail,
+            Text = lineText,
             FontFamily = new FontFamily("Consolas"),
             FontSize = 12,
             Foreground = MakeBrush("#9AA3AC"),

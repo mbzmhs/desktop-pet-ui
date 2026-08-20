@@ -7,9 +7,10 @@
         Background="Transparent"
         ShowInTaskbar="False"
         Topmost="True"
+        ShowActivated="False"
         ResizeMode="NoResize"
         WindowStartupLocation="CenterScreen"
-        Width="420" SizeToContent="Height">
+        Width="460" SizeToContent="Height">
     <Border Background="#E61B1F2A" CornerRadius="12" BorderBrush="#33FFFFFF" BorderThickness="1">
         <Grid Margin="14,10,14,12">
             <Grid.RowDefinitions>
