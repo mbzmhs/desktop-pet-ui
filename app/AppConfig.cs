@@ -86,7 +86,8 @@ public sealed class ChatConfig
     public ChatHotkeyConfig Hotkey { get; set; } = new();
     public ChatUiConfig Ui { get; set; } = new();
     public int ContextLength { get; set; } = 80;
-    /// <summary>上下文预算（token）：历史 token 量达到它的 70% 触发摘要压缩；聊天窗标题栏实时显示占用比。本地模型(≤64k上下文)默认 16000 安全，外部大上下文 API 可调大。</summary>
+    /// <summary>上下文预算（token）：总占用（系统提示+历史）达预算时触发摘要压缩、压到 ≤70%（滞回）；聊天窗标题栏实时显示占用比。
+    /// 模型接口自报的上下文上限更低时，实际预算取「上限−输出预留」与它的较小者（保证请求不超模型能力而报错）。默认 16000。</summary>
     public int ContextMaxTokens { get; set; } = 16000;
     public int ArchiveMaxEntries { get; set; } = 5000; // 归档记录上限（条），0=无上限
     public bool Proactive { get; set; } = false;

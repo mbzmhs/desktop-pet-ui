@@ -397,12 +397,16 @@ ExtraParamsBox.Text = CurrentProviderExtra();
                 ShowStatus("未获取到模型，请检查地址 / API Key", ok: false);
                 return;
             }
-            var prev = ApiModelBox.Text;
+            var prev = (ApiModelBox.Text ?? "").Trim();
             ApiModelBox.Items.Clear();
-            foreach (var m in models) ApiModelBox.Items.Add(m);
-            if (string.IsNullOrWhiteSpace(prev)) prev = models[0];
+            foreach (var m in models) ApiModelBox.Items.Add(m.Id);
+            // 保持之前的选择；若它不在本次列表里（换了服务器/模型已删）则选第一个
+            if (string.IsNullOrWhiteSpace(prev) || !models.Any(m => string.Equals(m.Id, prev, StringComparison.OrdinalIgnoreCase)))
+                prev = models[0].Id;
             ApiModelBox.Text = prev;
-            ShowStatus("获取到 " + models.Count + " 个模型");
+            LlamaClient.StoreModelContext(baseUrl, prev, models); // 记录各模型自报的上下文上限
+            var withCtx = models.Count(m => m.MaxContextTokens != null);
+            ShowStatus("获取到 " + models.Count + " 个模型" + (withCtx > 0 ? $"（{withCtx} 个提供了上下文上限）" : "（该 API 未提供上下文上限，按设置预算运行）"));
         }
         catch (Exception ex)
         {
@@ -451,6 +455,8 @@ ExtraParamsBox.Text = CurrentProviderExtra();
 
             _config.Save();
             App.RefreshAll();
+            var ep = _config.EffectiveLlm(); // 端点/模型可能刚改过：重新查询其自报的上下文上限
+            LlamaClient.RefreshModelContextAsync(ep.Url, ep.Model, ep.ApiKey);
             Log.Info("Global settings saved");
             ShowStatus("全局设置已保存并生效");
         }

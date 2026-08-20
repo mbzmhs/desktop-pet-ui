@@ -108,7 +108,7 @@ public partial class ChatWindow : Window
     {
         if (UsageText == null) return;
         var used = _pipeline.LastPromptTokens;
-        var budget = _config.Chat.ContextMaxTokens;
+        var budget = _pipeline.EffectiveContextBudget(); // 用户设置 ∩ 模型实际上限
         if (used <= 0 || budget <= 0)
         {
             UsageText.Visibility = Visibility.Collapsed;

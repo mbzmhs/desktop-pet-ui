@@ -70,6 +70,19 @@ public sealed class ChatPipeline : IDisposable
     /// <summary>校准的 token/字 比率（来自实际 usage÷发送字数）；未校准时按 ~1.5 字/token 折算。</summary>
     public double TokPerChar => _tokPerChar > 0 ? _tokPerChar : 1.0 / 1.5;
 
+    /// <summary>有效上下文预算（token）：用户设置与「模型实际最大上下文−输出预留」取较小者。
+    /// 模型上限由 /v1/models 提供；查不到时只按用户设置。0=不限。</summary>
+    public int EffectiveContextBudget()
+    {
+        var user = _config.Chat.ContextMaxTokens;
+        if (user <= 0) return 0;
+        var ep = _config.EffectiveLlm();
+        var modelMax = LlamaClient.ModelMaxContext(ep.Url, ep.Model);
+        if (modelMax == null || modelMax <= 0) return user;
+        var allow = modelMax.Value - _config.EffectiveMaxTokens - 512; // prompt+输出 max_tokens 都要装进模型上下文
+        return Math.Max(1024, Math.Min(user, allow));
+    }
+
     /// <summary>采样一次真实 token 用量：刷新显示值并校准折算比率。
     /// 只用于携带完整历史的请求（主聊天、agent 每步）；摘要压缩请求载荷不同，不在此采样。</summary>
     public void OnUsageSample(int promptTokens, int sentChars)
@@ -108,6 +121,7 @@ public sealed class ChatPipeline : IDisposable
         };
         // agent 循环每步也带 system+完整历史，其 usage 同样代表上下文占用（显示与比率校准）
         _agent.OnUsage = (pt, sc) => OnUsageSample(pt, sc);
+        _agent.TokPerCharProvider = () => TokPerChar; // 硬护栏裁剪用同一校准比率
     }
 
     public void Restore(string? summary, IEnumerable<ChatMessage> history)
@@ -318,7 +332,19 @@ public sealed class ChatPipeline : IDisposable
         var history = Sanitize(History); // 加锁快照，避免与 UI 线程遍历竞争
         ShrinkOldProtocol(history);     // agent 工具往返老化收缩：只影响发给模型的上下文
         messages.AddRange(history);
+        EnforceModelCap(messages);      // 硬护栏：估算超模型实际上限时丢最旧历史，保证不触发 API 报错
         return messages;
+    }
+
+    /// <summary>硬护栏（最后防线）：模型接口声明了上下文上限且估算总占用要超出时，从发送列表丢弃最旧历史。
+    /// 正常情况由压缩闸门提前处理，这里兜住估算偏差/突发超长消息；被丢的条目仍在 _history 与归档里。</summary>
+    private void EnforceModelCap(List<ChatMessage> messages)
+    {
+        var ep = _config.EffectiveLlm();
+        var modelMax = LlamaClient.ModelMaxContext(ep.Url, ep.Model);
+        if (modelMax == null || modelMax <= 0) return; // API 未提供上限：不干预
+        var dropped = LlamaClient.TrimToContextCap(messages, modelMax.Value, TokPerChar, _config.EffectiveMaxTokens + 512);
+        if (dropped > 0) Log.Info($"Context hard-cap: dropped {dropped} oldest history entries to fit model context ({modelMax} tok)");
     }
 
     /// <summary>agent 工具往返老化收缩：距末尾超过最近 10 条的协议消息截掉超长载荷，把上下文预算让给情感对话。
@@ -646,8 +672,8 @@ public sealed class ChatPipeline : IDisposable
     private async Task MaybeCompressAsync()
     {
         var max = _config.Chat.ContextLength;
-        // token 预算 → 字数预算（校准比率折算，未校准时默认 ~1.5 字/token）：压缩发生在请求前，只能用本地估算
-        var maxChars = _config.Chat.ContextMaxTokens > 0 ? (int)(_config.Chat.ContextMaxTokens / TokPerChar) : 0;
+        // 有效预算（用户设置 ∩ 模型实际上限）→ 字数预算（校准比率折算，未校准时默认 ~1.5 字/token）：压缩发生在请求前，只能用本地估算
+        var maxChars = EffectiveContextBudget() > 0 ? (int)(EffectiveContextBudget() / TokPerChar) : 0;
         if (max <= 0 && maxChars <= 0) return;
 
         List<ChatMessage> snap;
@@ -688,7 +714,7 @@ public sealed class ChatPipeline : IDisposable
         finally { SetCompressing(false); }
         int after;
         lock (_histLock) after = _history.Count;
-        var unit = _config.Chat.ContextMaxTokens > 0 ? _config.Chat.ContextMaxTokens + " tok" : "n/a";
+        var unit = EffectiveContextBudget() > 0 ? EffectiveContextBudget() + " tok" : "n/a";
         Log.Info($"History compressed: {count} msgs / budget {unit} -> {after} msgs");
     }
 

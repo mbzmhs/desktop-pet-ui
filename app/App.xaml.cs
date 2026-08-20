@@ -8,6 +8,7 @@ using System.Windows.Forms;
 using System.Windows.Interop;
 using System.Windows.Threading;
 using DesktopPetUi.Core;
+using DesktopPetUi.Core.Agent;
 using DesktopPetUi.Native;
 
 namespace DesktopPetUi;
@@ -27,6 +28,8 @@ public partial class App : System.Windows.Application
     private System.Windows.Forms.ContextMenuStrip? _trayMenu;
     private DispatcherTimer? _proactiveTimer;
     private bool _proactiveEnabled;
+    private readonly object _memSaveLock = new();
+    private System.Threading.Timer? _memSaveTimer; // 历史变更防抖自动保存
 
     public static AppConfig Config { get; private set; } = null!;
     public static PetWindow? PetWindow { get; private set; }
@@ -74,6 +77,7 @@ public partial class App : System.Windows.Application
         Config.LoadActiveCharacter();
         Log.Info("Active character: " + Config.EffectiveCharacterName);
         LlamaClient.ConfigureProxy(Config.Chat.Proxy);
+        AgentTools.ConfigureProxy(Config.Chat.Proxy); // web_fetch 与 LLM 共用代理设置
 
         base.OnStartup(e);
 
@@ -91,6 +95,9 @@ public partial class App : System.Windows.Application
                 _chatPipeline.DebugLog = text => _debugWindow?.Append(text);
                 _chatPipeline.SystemPromptDebug = text => _debugWindow?.SetSystemPrompt(text);
                 LlamaClient.OnRequest = (url, json) => _debugWindow?.SetRawRequest(url + "\n" + json);
+                var ep0 = Config.EffectiveLlm(); // 后台查询模型自报的上下文上限（保证请求不超它而报错）
+                LlamaClient.RefreshModelContextAsync(ep0.Url, ep0.Model, ep0.ApiKey);
+                _chatPipeline.HistoryChanged += ScheduleMemorySave; // 历史一变就自动落盘（防抖），意外退出不丢对话
                 _chatWindow = new ChatWindow(Config, _chatPipeline, () => _window?.GetWindowRect());
                 // 聊天窗可见时权限确认在聊天窗内完成，否则回退宠物气泡
                 _window.ConfirmRedirect = req => _chatWindow!.TryShowConfirmAsync(req);
@@ -294,6 +301,7 @@ public partial class App : System.Windows.Application
     {
         if (Current is not App app) return;
         LlamaClient.ConfigureProxy(Config.Chat.Proxy);
+        AgentTools.ConfigureProxy(Config.Chat.Proxy); // web_fetch 与 LLM 共用代理设置
         app.ConfigureProactiveTimer();
         PetWindow?.ApplyWindowConfig();
         PetWindow?.RefreshIdleCycle();
@@ -341,6 +349,16 @@ public partial class App : System.Windows.Application
         }
     }
 
+    /// <summary>历史变化后防抖自动保存（最后一次变更 1.5s 后）：进程被意外杀掉时最多丢 1.5s 内的对话。</summary>
+    private void ScheduleMemorySave()
+    {
+        lock (_memSaveLock)
+        {
+            _memSaveTimer?.Dispose();
+            _memSaveTimer = new System.Threading.Timer(_ => SaveChatMemory(), null, 1500, Timeout.Infinite);
+        }
+    }
+
     private void SaveChatMemory()
     {
         if (_chatPipeline == null) return;
@@ -354,7 +372,13 @@ public partial class App : System.Windows.Application
                 Summary = _chatPipeline.Summary,
                 History = _chatPipeline.History.ToList(),
             };
-            File.WriteAllText(path, JsonSerializer.Serialize(mem));
+            lock (_memSaveLock)
+            {
+                // 先写临时文件再原子改名：写到一半被杀不会留下半截损坏的 memory.json（损坏会导致整段历史加载失败）
+                var tmp = path + ".tmp";
+                File.WriteAllText(tmp, JsonSerializer.Serialize(mem));
+                File.Move(tmp, path, overwrite: true);
+            }
         }
         catch (Exception ex)
         {

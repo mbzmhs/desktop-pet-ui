@@ -25,6 +25,9 @@ public sealed class AgentRunner
     /// <summary>每次 LLM 补全后触发 (prompt_tokens, 发送总字数)；agent 每步都带完整历史，由管线校准 token/字比率并刷新显示。</summary>
     public Action<int, int>? OnUsage { get; set; }
 
+    /// <summary>token/字 比率提供器（管线注入）：硬护栏裁剪用；null=未校准时默认 ~1.5 字/token。</summary>
+    public Func<double>? TokPerCharProvider { get; set; }
+
     public AgentRunner(AppConfig config) => _config = config;
 
     /// <summary>
@@ -225,6 +228,10 @@ public sealed class AgentRunner
     private async Task<string> CompleteAsync(List<ChatMessage> messages)
     {
         var ep = _config.EffectiveLlm();
+        // 硬护栏：循环中工具往返不断累积，每次请求前都按模型实际上限裁剪（只改工作列表，长期历史不动）
+        var modelMax = LlamaClient.ModelMaxContext(ep.Url, ep.Model);
+        if (modelMax != null && modelMax > 0)
+            LlamaClient.TrimToContextCap(messages, modelMax.Value, TokPerCharProvider?.Invoke() ?? 1.0 / 1.5, _config.EffectiveMaxTokens + 512);
         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] → agent llama " + ep.Url + " model=" + ep.Model);
         var result = await LlamaClient.CompleteAsync(
             ep.Url, messages, ep.Model,

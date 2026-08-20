@@ -1033,15 +1033,43 @@ public static class AgentTools
     }
 
     // 浏览器样请求头：不少站点反爬见 UA 缺失/异常直接回「版本太低」拦截页；Cookie 容器处理首次响应种 cookie 放行
-    private static readonly Lazy<HttpClient> Http = new(() =>
+    // 代理与 LLM 请求共用「网络代理」设置（启动/保存设置时经 ConfigureProxy 注入）
+    private static readonly object _webProxyLock = new();
+    private static ProxyConfig? _webProxyCfg;
+    private static HttpClient WebHttp = BuildWebClient();
+
+    private static HttpClient BuildWebClient()
     {
-        var client = new HttpClient(new HttpClientHandler { UseCookies = true, CookieContainer = new CookieContainer() })
-        { Timeout = TimeSpan.FromSeconds(20) };
+        var handler = new HttpClientHandler { UseCookies = true, CookieContainer = new CookieContainer() };
+        var cfg = _webProxyCfg;
+        var mode = cfg?.Mode ?? "system";
+        if (string.Equals(mode, "none", StringComparison.OrdinalIgnoreCase))
+            handler.UseProxy = false;
+        else if (string.Equals(mode, "custom", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(cfg?.Address))
+        {
+            handler.UseProxy = true;
+            handler.Proxy = new System.Net.WebProxy(cfg!.Address.Trim());
+        }
+        else
+            handler.UseProxy = true; // 系统代理（默认）
+        var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
         client.DefaultRequestHeaders.Accept.ParseAdd("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
         client.DefaultRequestHeaders.AcceptLanguage.ParseAdd("zh-CN,zh;q=0.9,en;q=0.8");
         return client;
-    });
+    }
+
+    /// <summary>配置 web_fetch 代理（与 LLM 请求共用「网络代理」设置）。</summary>
+    public static void ConfigureProxy(ProxyConfig? cfg)
+    {
+        lock (_webProxyLock)
+        {
+            _webProxyCfg = cfg;
+            var old = WebHttp;
+            WebHttp = BuildWebClient();
+            try { old.Dispose(); } catch { }
+        }
+    }
 
     /// <summary>读取响应正文（带上限，防超大页面吃内存；内容最终会被截到 6000 字）。</summary>
     private static async Task<string> ReadCappedAsync(HttpContent content, int maxBytes)
@@ -1075,11 +1103,11 @@ public static class AgentTools
         if (!IsPublicHost(uri)) return "错误：拒绝访问内网/本地地址 " + uri.Host;
         try
         {
-            using var resp = await Http.Value.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+            using var resp = await WebHttp.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
             if (!resp.IsSuccessStatusCode) return "错误：HTTP " + (int)resp.StatusCode + "（" + uri.ToString() + "）";
             var text = await ReadCappedAsync(resp.Content, 2 * 1024 * 1024); // 最多读 2MB
             var isHtml = (resp.Content.Headers.ContentType?.MediaType ?? "").Contains("html", StringComparison.OrdinalIgnoreCase);
-            if (isHtml) text = HtmlToText(text);
+            if (isHtml) text = HtmlToText(text, resp.RequestMessage!.RequestUri!); // 用重定向后的最终 URL 作相对链接 base
             else
             {
                 // 非 HTML：压缩连续空白行
@@ -1145,9 +1173,22 @@ public static class AgentTools
         return v6[10] == 0xFF && v6[11] == 0xFF;
     }
 
-    /// <summary>HTML → 纯文本：去 script/style、换行块级标签、剥标签、解码常见实体。</summary>
-    private static string HtmlToText(string html)
+    /// <summary>HTML → 纯文本：保留超链接（标题+绝对URL）、去 script/style、换行块级标签、剥标签、解码常见实体。</summary>
+    private static string HtmlToText(string html, Uri baseUri)
     {
+        // 超链接先行：<a href="...">标题</a> → 标题（绝对URL）。直接剥标签会丢掉 href，
+        // 搜索页等"标题+链接"列表就只剩标题拿不到地址（如 B 站结果页的 BV 号）
+        html = System.Text.RegularExpressions.Regex.Replace(html,
+            "<a\\s[^>]*?href\\s*=\\s*\"(?<h>[^\"]+)\"[^>]*>(?<t>.*?)</a>",
+            m =>
+            {
+                var href = m.Groups["h"].Value;
+                var text = System.Text.RegularExpressions.Regex.Replace(m.Groups["t"].Value, "<[^>]+>", "").Trim();
+                string abs;
+                try { abs = new Uri(baseUri, href).ToString(); } catch { abs = href; } // 相对/协议相对路径按页面 base 解析
+                return string.IsNullOrEmpty(text) ? abs : text + "（" + abs + "）";
+            },
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
         var s = System.Text.RegularExpressions.Regex.Replace(html, "(?is)<(script|style|head)[^>]*>.*?</\\1>", " ");
         s = System.Text.RegularExpressions.Regex.Replace(s, "(?s)<br[^>]*>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n");
         s = System.Text.RegularExpressions.Regex.Replace(s, "<[^>]+>", " ");

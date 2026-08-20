@@ -249,7 +249,7 @@
                     <TextBox x:Name="ExtraParamsBox" Grid.Row="5" Grid.Column="2" Margin="0,0,0,8"
                              FontFamily="Consolas" FontSize="12"
                              Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
-                    <TextBlock Grid.Row="6" Grid.Column="0" Text="网络代理（仅 LLM 请求）" Foreground="#444" Margin="0,0,0,4"/>
+                    <TextBlock Grid.Row="6" Grid.Column="0" Text="网络代理（LLM 与 web_fetch 请求）" Foreground="#444" Margin="0,0,0,4"/>
                     <Grid Grid.Row="6" Grid.Column="2" Margin="0,0,0,8">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="150"/>
@@ -334,23 +334,14 @@
                         </StackPanel>
                     </Grid>
 
-                    <Grid Grid.Row="16" Grid.ColumnSpan="3" Margin="0,0,0,12">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Grid.Column="0">
-                            <TextBlock Text="上下文预算（token）" Foreground="#444" Margin="0,0,0,4"/>
-                            <TextBox x:Name="ContextMaxTokensBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
-                            <TextBlock Text="历史 token 量达到它的 70% 时压缩最旧部分；聊天窗标题栏实时显示占用比。按所用模型上下文调整（本地 ≤64k 建议 ≤16000，外部大上下文 API 可更大）；摘要输出量约为 1/8" Foreground="#999" Margin="0,4,0,0"/>
-                        </StackPanel>
-                        <StackPanel Grid.Column="1">
-                            <TextBlock Text="归档记录上限（条）" Foreground="#444" Margin="0,0,0,4"/>
-                            <TextBox x:Name="ArchiveMaxEntriesBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
-                            <TextBlock Text="压缩归档的历史记录最多保留多少条；0 表示无上限，超出时丢最旧" Foreground="#999" Margin="0,4,0,0"/>
-                        </StackPanel>
-                    </Grid>
+                    <StackPanel Grid.Row="16" Grid.ColumnSpan="3" Margin="0,0,0,12">
+                        <TextBlock Text="上下文预算（token）" Foreground="#444" Margin="0,0,0,4"/>
+                        <TextBox x:Name="ContextMaxTokensBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                        <TextBlock Text="总占用（系统提示+历史）达预算时压缩最旧部分，压到 ≤70%（滞回）；聊天窗标题栏实时显示占用比。若模型接口自报的上下文上限更低，实际以「上限−输出预留」为准" Foreground="#999" Margin="0,4,0,16" TextWrapping="Wrap"/>
+                        <TextBlock Text="归档记录上限（条）" Foreground="#444" Margin="0,0,0,4"/>
+                        <TextBox x:Name="ArchiveMaxEntriesBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                        <TextBlock Text="压缩归档的历史记录最多保留多少条；0 表示无上限，超出时丢最旧" Foreground="#999" Margin="0,4,0,0" TextWrapping="Wrap"/>
+                    </StackPanel>
 
                     <Grid Grid.Row="17" Grid.ColumnSpan="3" Margin="0,0,0,12">
                         <CheckBox x:Name="ReadInnerThoughtsCheck"
@@ -358,7 +349,7 @@
                                   Foreground="#222" VerticalAlignment="Center"/>
                     </Grid>
 
-                    <Grid Grid.Row="15" Grid.ColumnSpan="3">
+                    <Grid Grid.Row="18" Grid.ColumnSpan="3" Margin="0,8,0,0">
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button Content="保存全局设置" Click="OnSaveGlobal"
                                     Background="#3A7A4A" Foreground="White" BorderThickness="0" Padding="16,7" Margin="0,0,8,0"/>
