@@ -29,6 +29,13 @@ public sealed class AgentRunner
     /// <summary>token/字 比率提供器（管线注入）：硬护栏裁剪用；null=未校准时默认 ~1.5 字/token。</summary>
     public Func<double>? TokPerCharProvider { get; set; }
 
+    /// <summary>流式增量回调（参数=该步到目前为止的累计全文；仅展示层用）。管线注入时会做 [tool] 门控：
+    /// 一旦出现 [tool] 说明是中间工具步，停止转发并收尾打字气泡，避免把工具 JSON 闪现出来。</summary>
+    public Action<string>? OnStreamDelta { get; set; }
+
+    /// <summary>该步流式传输结束（均触发一次；与 OnStreamDelta 配对）。参数=是否正常生成完毕（false=出错/停止）。</summary>
+    public Action<bool>? OnStreamEnd { get; set; }
+
     public AgentRunner(AppConfig config) => _config = config;
 
     /// <summary>
@@ -78,6 +85,8 @@ public sealed class AgentRunner
             ct.ThrowIfCancellationRequested(); // 步间停止
             var reply = await CompleteAsync(messages, ct);
             if (string.IsNullOrWhiteSpace(reply)) return "";
+            var replyAt = DateTime.Now; // 文本生成完毕时刻（工具裁定/执行之前）：给这条 assistant 消息打时间戳，
+                                        // 保证正文气泡排在同一步的自动放行/确认记录之前（与 TTS 开始朗读的时刻一致）
 
             string? feedback = null; // 非 null 时回填给模型继续循环
             List<string>? feedbackImages = null; // 工具结果携带的截图（随反馈消息发给视觉模型）
@@ -165,7 +174,7 @@ public sealed class AgentRunner
                 return reply; // 最终回答（情感标签由管线后续解析）
             }
 
-            var aMsg = new ChatMessage { Role = "assistant", Content = reply };
+            var aMsg = new ChatMessage { Role = "assistant", Content = reply, Timestamp = replyAt };
             messages.Add(aMsg);
             OnMessage?.Invoke(aMsg); // 中间往返进长期历史：模型跨对话保留工具用法与操作记忆（opencode 式）
             var fbMsg = new ChatMessage { Role = "user", Content = feedback };
@@ -246,12 +255,33 @@ public sealed class AgentRunner
         if (modelMax != null && modelMax > 0)
             LlamaClient.TrimToContextCap(messages, modelMax.Value, TokPerCharProvider?.Invoke() ?? 1.0 / 1.5, _config.EffectiveMaxTokens + 512);
         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] → agent llama " + ep.Url + " model=" + ep.Model);
-        var result = await LlamaClient.CompleteAsync(
-            ep.Url, messages, ep.Model,
-            _config.EffectiveTemperature, _config.EffectiveMaxTokens,
-            ep.ApiKey, ep.ExtraParams, ct);
-        // 每步都带 system+完整历史：上报真实 usage（上下文占用显示与 token/字比率校准）
-        OnUsage?.Invoke(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0));
+        ChatResult result;
+        if (OnStreamDelta != null && _config.Chat.StreamEnabled)
+        {
+            var streamOk = false;
+            try
+            {
+                result = await LlamaClient.CompleteStreamAsync(
+                    ep.Url, messages, ep.Model,
+                    _config.EffectiveTemperature, _config.EffectiveMaxTokens,
+                    OnStreamDelta,
+                    ep.ApiKey, ep.ExtraParams, ct);
+                streamOk = true;
+            }
+            finally
+            {
+                OnStreamEnd?.Invoke(streamOk); // 每步流结束：展示层收尾（管线再结合 [tool] 抑制状态决定移除还是冻结）
+            }
+        }
+        else
+        {
+            result = await LlamaClient.CompleteAsync(
+                ep.Url, messages, ep.Model,
+                _config.EffectiveTemperature, _config.EffectiveMaxTokens,
+                ep.ApiKey, ep.ExtraParams, ct);
+        }
+        if (result.Usage.PromptTokens > 0)
+            OnUsage?.Invoke(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0)); // 每步都带完整历史：真实 usage（流式拿不到时跳过，沿用上次值）
         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] ← agent llama 回复:\n" + result.Text);
         return result.Text;
     }

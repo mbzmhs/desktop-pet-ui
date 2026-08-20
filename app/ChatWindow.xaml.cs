@@ -4,6 +4,8 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Threading;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -53,9 +55,19 @@ public partial class ChatWindow : Window
 
     private ConfirmCard? _pendingConfirm;
     private AskCard? _pendingAsk;
+    // —— 流式打字气泡（仅展示层；TTS/历史仍按整条处理）——
+    private StreamTagFilter? _streamFilter; // 非 null=正在流式接收
+    private string _streamRaw = "";        // 已收到的累计原始全文（算增量用）
+    private string _streamShown = "";      // 气泡里已累计的显示文本（每片是"新释放部分"，必须追加而非替换）
+    private FrameworkElement? _streamBubble; // 临时气泡元素（RebuildMessages 会清面板，需按需重挂）
+    private TextBlock? _streamText;
+    private bool _streamFrozen;             // 被 [tool] 抑制/出错后冻结：保留已显示文本（去光标），等新流或历史重建替换
     private List<AgentOpRecord> _ops = new(); // agent 操作日志（磁盘加载 + 实时事件），仅 UI 线程读写
     private readonly HashSet<string> _expanded = new(); // 已展开的工具返回行（按消息全文为键，RebuildMessages 后状态不丢）
     private string? _opsChar;                 // 已加载操作日志所属角色（切换角色时自动重载）
+    // 消息元素缓存：内容没变的消息复用已渲染的 DOM（Markdown 重渲染是每轮重建的主要耗时），
+    // 键=角色|时间戳|全文|展开态；上限防膨胀，换角色整体清空。
+    private readonly Dictionary<string, FrameworkElement> _msgElCache = new();
 
     public ChatWindow(AppConfig config, ChatPipeline pipeline, Func<Rect?> petRect)
     {
@@ -90,10 +102,12 @@ public partial class ChatWindow : Window
 
         _pipeline.Status = SetStatus;
         _pipeline.HistoryChanged += () => RebuildMessages();
+        _pipeline.ReplyDelta += OnReplyDelta; // 流式打字（后台线程触发）
+        _pipeline.ReplyStreamEnd += OnReplyStreamEnd;
         _pipeline.OpAdded += OnOpAdded;
         _pipeline.UsageChanged += () => Dispatcher.Invoke(UpdateUsageLabel); // usage 在后台线程更新
         _pipeline.CompressingChanged += v => Dispatcher.Invoke(() => OnCompressing(v)); // 压缩期间提示+锁定输入
-        SizeChanged += (s, e) => SaveLayout(); // 拖角缩放后落盘
+        SizeChanged += OnLiveSizeChanged; // 拖动中检测到尺寸变化→隐藏消息面板（免逐像素重排）；松手后统一重建+落盘
         TitleText.Text = "和" + (string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName) + "聊天";
         RebuildMessages();
     }
@@ -202,6 +216,51 @@ public partial class ChatWindow : Window
         try { _config.Save(); } catch { /* 忽略保存失败 */ }
     }
 
+    // —— 拖动缩放优化：Win32 WM_ENTERSIZEMOVE/EXITSIZEMOVE 标记拖动区间。
+    // 拖动中消息面板整体隐藏（几十个换行 TextBlock 逐像素重排是卡顿主因），松手后按新宽度重建一次并落盘一次；
+    // 纯移动（宽高不变）不隐藏，避免每次挪窗口都闪一下。
+    private bool _sizeMove;
+    private double _smW, _smH;
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        if (PresentationSource.FromVisual(this) is HwndSource src)
+            src.AddHook(SizeMoveHook);
+    }
+
+    private IntPtr SizeMoveHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg == 0x00A0) // WM_ENTERSIZEMOVE（移动或缩放开始）
+        {
+            _sizeMove = true;
+            _smW = Width;
+            _smH = Height;
+            MsgPanel.Visibility = Visibility.Visible; // 复位（上次异常退出可能残留隐藏态）
+        }
+        else if (msg == 0x00A2) // WM_EXITSIZEMOVE（松手）
+        {
+            if (!_sizeMove) return IntPtr.Zero;
+            _sizeMove = false;
+            var resized = Math.Abs(Width - _smW) > 0.5 || Math.Abs(Height - _smH) > 0.5;
+            MsgPanel.Visibility = Visibility.Visible;
+            if (resized)
+            {
+                _msgElCache.Clear(); // 缓存元素的 MaxWidth 是按旧宽度烘焙的，换宽后必须重渲染
+                RebuildMessages(scrollToEnd: false); // 松手后才重新计算渲染（保持当前滚动位置）
+            }
+            SaveLayout(); // 整个拖动只落盘一次（原来每个像素都写整份 config）
+        }
+        return IntPtr.Zero;
+    }
+
+    private void OnLiveSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        // 拖动中且尺寸真的在变（区别于纯移动）：隐藏消息面板跳过逐像素布局
+        if (_sizeMove && (Math.Abs(Width - _smW) > 0.5 || Math.Abs(Height - _smH) > 0.5) && MsgPanel.Visibility == Visibility.Visible)
+            MsgPanel.Visibility = Visibility.Collapsed;
+    }
+
     private void ClampToScreen()
     {
         var v = GetVirtualScreen();
@@ -243,7 +302,9 @@ public partial class ChatWindow : Window
         {
             _opsChar = curChar;
             _ops = new List<AgentOpRecord>(AgentOpLog.Load(_config));
+            _msgElCache.Clear(); // 换角色：消息与操作日志都换了，缓存全失效
         }
+        if (_msgElCache.Count > 600) _msgElCache.Clear(); // 上限兜底（历史被压缩/清空后旧键不会再来）
 
         MsgPanel.Children.Clear();
 
@@ -254,14 +315,30 @@ public partial class ChatWindow : Window
         foreach (var m in history)
         {
             var isUser = m.Role == "user";
-            var el = IsProtocolMessage(m)
-                ? BuildExchangeLine(m)
-                : BuildBubble(isUser, isUser ? "你" : name, m.Timestamp, ToDisplay(m.Content));
+            // 缓存键含展开态：[result]/[error] 折叠/切换展开时重建为不同元素
+            var key = (isUser ? "u" : "a") + "\u0001" + m.Timestamp.Ticks + "\u0001" + m.Content
+                      + (_expanded.Contains(m.Content) ? "\u0002e" : "");
+            FrameworkElement el;
+            if (!_msgElCache.TryGetValue(key, out el))
+            {
+                el = IsProtocolMessage(m)
+                    ? BuildExchangeLine(m)
+                    : BuildBubble(isUser, isUser ? "你" : name, m.Timestamp, ToDisplay(m.Content));
+                _msgElCache[key] = el;
+            }
             items.Add((m.Timestamp, el));
         }
         // 早于第一条聊天记录的 agent 操作不进窗（清空记录后不残留一排孤行）；数据仍在 agent_ops.json，记忆管理器可见可清
         foreach (var op in _ops.Where(o => o.Ts >= firstTs))
-            items.Add((op.Ts, BuildOpLine(op)));
+        {
+            var key = "op\u0001" + op.Ts.Ticks + "\u0001" + op.Tool + "\u0001" + op.Verdict + "\u0001" + op.Title + "\u0001" + op.Detail;
+            if (!_msgElCache.TryGetValue(key, out var el))
+            {
+                el = BuildOpLine(op);
+                _msgElCache[key] = el;
+            }
+            items.Add((op.Ts, el));
+        }
         // 稳定排序：时间戳相同（同一毫秒的工具往返）保持插入顺序
         var ordered = items.Select((it, i) => new { it.El, Ts = it.Ts, I = i })
                            .OrderBy(x => x.Ts).ThenBy(x => x.I)
@@ -272,6 +349,8 @@ public partial class ChatWindow : Window
             MsgPanel.Children.Add(_pendingConfirm.Card); // 未决确认卡片保持在消息流末尾
         if (_pendingAsk != null && !_pendingAsk.Resolved)
             MsgPanel.Children.Add(_pendingAsk.Card);     // 未决提问卡片同理
+        if (_streamFilter != null && _streamBubble?.Parent == null)
+            MsgPanel.Children.Add(_streamBubble!);       // 流式打字气泡同样保持在最末尾（Clear 后重挂）
         if (scrollToEnd) ScrollToEnd();
     }
 
@@ -330,6 +409,104 @@ public partial class ChatWindow : Window
         }
         _ops.Add(rec);
         RebuildMessages();
+    }
+
+    // ---------------- 流式打字气泡 ----------------
+
+    /// <summary>流式增量（后台线程）：维护消息流末尾的临时"打字中"气泡。正式回复落历史后由 HistoryChanged 重建替换。</summary>
+    private void OnReplyDelta(string soFar)
+    {
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (_streamFilter == null) // 新的一条流（主动搭话/重试等）：先清掉上一轮冻结的残影
+            {
+                if (_streamFrozen) RemoveStreamBubble();
+                _streamFrozen = false;
+                _streamFilter = new StreamTagFilter(_pipeline.AvailableEmotions);
+                _streamRaw = "";
+                _streamShown = "";
+            }
+            if (soFar.Length <= _streamRaw.Length) return; // 重复/乱序片：忽略
+            var piece = soFar[_streamRaw.Length..];
+            _streamRaw = soFar;
+
+            UpdateStreamBubble(_streamFilter.Feed(piece));
+        }));
+    }
+
+    /// <summary>流结束（均触发）：completed=true 正常完成 → 移除临时气泡（正式版随后由历史重建）；
+    /// false 被 [tool] 抑制/出错/停止 → 冻结已显示文本（去光标）保留在面板上，避免"打到最后突然清空"，等工具往返落历史的重建或下一条新流替换。</summary>
+    private void OnReplyStreamEnd(bool completed)
+    {
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            if (completed)
+            {
+                var tail = _streamFilter?.Flush(); // 释放扣留的尾部（含未决 '[' 序列）；注意只传 tail 本身（新片段），不是累计全文
+                if (!string.IsNullOrEmpty(tail)) UpdateStreamBubble(tail);
+                // 临时气泡延迟到背景优先级移除：让随后入队的 HistoryChanged→RebuildMessages 先跑完，
+                // 正式版气泡就位后再摘临时版——消除"打字气泡消失→空白→正式气泡出现"的空窗卡顿感
+                Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(RemoveStreamBubble));
+            }
+            else if (_streamText != null)
+            {
+                _streamFrozen = true;
+                _streamText.Text = _streamShown; // 去掉 ▍ 光标，冻结显示
+            }
+            _streamFilter = null;
+            _streamRaw = "";
+        }));
+    }
+
+    private void UpdateStreamBubble(string releasedText)
+    {
+        // RebuildMessages 可能刚清过面板：气泡不在树上就重新挂到末尾
+        if (_streamBubble == null || _streamBubble.Parent == null)
+        {
+            var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
+            _streamText = new TextBlock
+            {
+                TextWrapping = TextWrapping.Wrap,
+                FontSize = 13,
+                Foreground = MakeBrush("#E8ECF2"),
+            };
+            var bubble = new Border
+            {
+                Background = MakeBrush("#34383F"),
+                CornerRadius = new CornerRadius(10),
+                Padding = new Thickness(10, 7, 10, 7),
+                Child = _streamText,
+            };
+            var stack = new StackPanel
+            {
+                HorizontalAlignment = HorizontalAlignment.Left,
+                MaxWidth = Math.Max(220, MsgPanel.ActualWidth * 0.82),
+                Margin = new Thickness(0, 5, 0, 5),
+            };
+            stack.Children.Add(bubble);
+            stack.Children.Add(new TextBlock
+            {
+                Text = name + "  输入中…",
+                FontSize = 10.5,
+                Foreground = MakeBrush("#777"),
+                Margin = new Thickness(2, 2, 2, 0),
+            });
+            _streamBubble = stack;
+            MsgPanel.Children.Add(stack);
+        }
+        // 打字光标：尾部加闪烁块（纯文本，流结束即移除）。Feed 返回的是"本片新释放的片段"，要追加到已累计文本后面
+        _streamShown += releasedText ?? "";
+        _streamText!.Text = _streamShown + "▍";
+        ScrollToEnd();
+    }
+
+    private void RemoveStreamBubble()
+    {
+        if (_streamBubble != null && _streamBubble.Parent != null)
+            MsgPanel.Children.Remove(_streamBubble);
+        _streamBubble = null;
+        _streamText = null;
+        _streamFrozen = false;
     }
 
     // ---------------- 窗口内权限确认 ----------------
@@ -765,6 +942,7 @@ public partial class ChatWindow : Window
         var c = (m.Content ?? "").Trim();
         string prefix, text;
         bool expandable = false;
+        string _prose = ""; // [tool] 前的角色正文（仅 assistant 工具消息有值）
         if (m.Role == "user")
         {
             if (c.StartsWith("[note]", StringComparison.OrdinalIgnoreCase)) { prefix = "◈"; text = c.Substring(6).Trim(); }
@@ -786,6 +964,11 @@ public partial class ChatWindow : Window
             var rm = Regex.Match(c, "\"reason\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase);
             if (rm.Success && !string.IsNullOrWhiteSpace(rm.Groups[1].Value))
                 text += " · " + rm.Groups[1].Value;
+
+            // [tool] 之前的正文（模型的角色语气开场白，如"[happy]好的主人～…"）：流式打字时用户已读到它，
+            // 重建后必须保留显示（剥情绪标签），否则"打到最后突然消失"。放在紧凑工具行上方。
+            var toolIdx = c.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase);
+            if (toolIdx > 0) _prose = ToDisplay(c[..toolIdx]);
         }
 
         const int collapsedLen = 120;
@@ -827,7 +1010,14 @@ public partial class ChatWindow : Window
                 RebuildMessages(scrollToEnd: false); // 原地切换，不跳底
             };
         }
-        return tb;
+
+        if (string.IsNullOrWhiteSpace(_prose)) return tb;
+        // 正文 + 工具行：正文用宠物气泡包裹（与流式打字气泡观感一致），工具行保持等宽紧凑
+        var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
+        var stack = new StackPanel();
+        stack.Children.Add(BuildBubble(false, name, m.Timestamp, _prose));
+        stack.Children.Add(tb);
+        return stack;
     }
 
     /// <summary>agent 操作记录行（区别于对话气泡）：裁定徽标 + 等宽命令详情 + 时间戳，灰底小卡。</summary>

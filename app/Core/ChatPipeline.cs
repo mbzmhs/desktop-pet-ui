@@ -53,8 +53,16 @@ public sealed class ChatPipeline : IDisposable
     public event Action? UsageChanged;
     /// <summary>历史压缩进行中变化（true=开始压缩，false=结束；后台线程触发）。压缩期间聊天窗应提示并锁定输入。</summary>
     public event Action<bool>? CompressingChanged;
+    /// <summary>流式回复增量（参数=到目前为止的累计原始全文，含未剥离的情绪标签；后台线程触发，仅展示层用）。
+    /// 仅在 StreamEnabled 且走流式路径时触发；TTS/历史仍按整条 rawReply 处理，与此无关。</summary>
+    public event Action<string>? ReplyDelta;
+    /// <summary>本次流式传输结束（均会触发一次；后台线程触发）。参数 completed：
+    /// true=正常生成完毕（展示层移除临时气泡，正式版由历史重建）；
+    /// false=被 [tool] 门控抑制/出错/停止（展示层冻结已显示文本去光标，保留到历史重建替换，避免"打到最后突然清空"）。</summary>
+    public event Action<bool>? ReplyStreamEnd;
     public bool IsRunning { get; private set; }
     private CancellationTokenSource? _runCts;
+    private bool _agentStreamSuppressed; // agent 当前流已出现 [tool]（中间工具步）：打字气泡已收尾，后续片不再转发
 
     /// <summary>手动停止当前运行：立即中止进行中的 LLM 请求/工具；用户发起的轮次会在历史留中断标记。不视为错误。</summary>
     public void Stop() => _runCts?.Cancel();
@@ -121,11 +129,28 @@ public sealed class ChatPipeline : IDisposable
         {
             // 工具往返写入长期历史（角色严格交替 user/assistant，Sanitize 不会误合并）；
             // 后续对话的上下文里就有完整操作轨迹，模型不再"只说不做"。膨胀由记忆压缩兜底。
-            lock (_histLock) _history.Add(new ChatMessage { Role = m.Role, Content = m.Content });
+            // Timestamp 原样携带：assistant 步=文本生成完毕时刻（工具裁定前），保证正文气泡排在自动放行记录之前
+            lock (_histLock) _history.Add(new ChatMessage { Role = m.Role, Content = m.Content, Timestamp = m.Timestamp });
             NotifyHistory();
         };
         // agent 循环每步也带 system+完整历史，其 usage 同样代表上下文占用（显示与比率校准）
         _agent.OnUsage = (pt, sc) => OnUsageSample(pt, sc);
+        // agent 各步流式增量 → 聊天窗打字气泡；[tool] 门控：累计文本一旦出现 [tool] 就是中间工具步，
+        // 立即收尾气泡且不再转发（最终纯文字回答不含 [tool]，情绪标签 [happy] 之类不受影响照常流）
+        _agent.OnStreamDelta = soFar =>
+        {
+            // 每条流的累计文本从零开始，_agentStreamSuppressed 随新流自然复位（首片不含 [tool]）
+            if (soFar.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                if (!_agentStreamSuppressed) { _agentStreamSuppressed = true; ReplyStreamEnd?.Invoke(false); } // 中间工具步：冻结已显示文本，后续片静默丢弃（只收尾一次）
+            }
+            else
+            {
+                _agentStreamSuppressed = false;
+                ReplyDelta?.Invoke(soFar);
+            }
+        };
+        _agent.OnStreamEnd = completed => ReplyStreamEnd?.Invoke(completed && !_agentStreamSuppressed); // 正常完成且未被抑制=true
         _agent.TokPerCharProvider = () => TokPerChar; // 硬护栏裁剪用同一校准比率
     }
 
@@ -398,7 +423,7 @@ public sealed class ChatPipeline : IDisposable
                 rawReply = await _agent.RunAsync(messages, host, cts.Token); // 工具循环（中间往返经 OnMessage 进长期历史）
             else
             {
-                rawReply = await CompleteAsync(messages, null, cts.Token);
+                rawReply = await CompleteAsync(messages, null, cts.Token, onDelta: _ => { }); // 流式：聊天窗实时打字（ReplyDelta 事件）
                 // agent 关闭时模型若模仿历史输出 [tool]：回灌"工具不可用"纠正并让它改用文字回答（最多 2 次），往返持久化防止复发
                 const string noToolFeedback = "[error] Agent 功能未开启，无法调用工具。请直接用文字回答：可以说明需要做什么、或提醒用户在设置里开启 Agent 后再试。不要再输出 [tool] 块。";
                 for (var guard = 0; guard < 2 && rawReply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0; guard++)
@@ -410,7 +435,7 @@ public sealed class ChatPipeline : IDisposable
                     }
                     messages.Add(new ChatMessage { Role = "assistant", Content = rawReply });
                     messages.Add(new ChatMessage { Role = "user", Content = noToolFeedback });
-                    rawReply = await CompleteAsync(messages, null, cts.Token);
+                    rawReply = await CompleteAsync(messages, null, cts.Token, onDelta: _ => { });
                 }
                 if (rawReply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
                     rawReply = AgentRunner.StripToolBlocks(rawReply); // 仍不合规：剥离工具块只留文字部分
@@ -427,7 +452,7 @@ public sealed class ChatPipeline : IDisposable
         catch (OperationCanceledException) when (_runCts?.IsCancellationRequested == true)
         {
             // 手动停止：历史留中断标记（assistant 角色保持 user/assistant 交替），模型下次知道任务被终止、做到哪了
-            lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = "[system] 用户手动停止了本次任务（未完成）。进度见历史与 Todo 列表，不要假设未完成的步骤已成功；若用户要求继续，从上次停止处接着做。" });
+            lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = "[system] 用户手动停止了本次任务（未完成）。" });
             NotifyHistory();
             Status?.Invoke("已停止");
             return false;
@@ -462,11 +487,11 @@ public sealed class ChatPipeline : IDisposable
             if (messages.Count == 0 || messages[^1].Role != "user")
                 messages.Add(new ChatMessage { Role = "user", Content = silence });
 
-            var rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature, cts.Token);
+            var rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature, cts.Token, onDelta: _ => { }); // 流式：聊天窗实时打字
             if (_lastProactive != null && IsNearRepeat(rawReply, _lastProactive))
             {
                 messages[^1] = new ChatMessage { Role = "user", Content = messages[^1].Content + "\n" + ProactiveRepeatInstruction() };
-                rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature, cts.Token);
+                rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature, cts.Token, onDelta: _ => { });
             }
             _lastProactive = rawReply;
 
@@ -551,20 +576,48 @@ public sealed class ChatPipeline : IDisposable
         return "（刚才说了重复的内容，请换个新话题搭话）";
     }
 
-    private async Task<string> CompleteAsync(List<ChatMessage> messages, double? temperatureOverride = null, CancellationToken ct = default)
+    /// <param name="onDelta">非 null 且 StreamEnabled 时走 SSE 流式（每片回调累计全文）；否则原非流式整包路径。</param>
+    private async Task<string> CompleteAsync(List<ChatMessage> messages, double? temperatureOverride = null, CancellationToken ct = default, Action<string>? onDelta = null)
     {
         var ep = _config.EffectiveLlm();
         DebugLog?.Invoke(FormatRequest(ep.Url, ep.Model, messages));
-        var result = await LlamaClient.CompleteAsync(
-            ep.Url,
-            messages,
-            ep.Model,
-            temperatureOverride ?? _config.EffectiveTemperature,
-            _config.EffectiveMaxTokens,
-            ep.ApiKey,
-            ep.ExtraParams,
-            ct);
-        OnUsageSample(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0)); // 真实上下文 token：显示+比率校准
+        ChatResult result;
+        if (onDelta != null && _config.Chat.StreamEnabled)
+        {
+            var streamOk = false;
+            try
+            {
+                result = await LlamaClient.CompleteStreamAsync(
+                    ep.Url,
+                    messages,
+                    ep.Model,
+                    temperatureOverride ?? _config.EffectiveTemperature,
+                    _config.EffectiveMaxTokens,
+                    soFar => { onDelta(soFar); ReplyDelta?.Invoke(soFar); },
+                    ep.ApiKey,
+                    ep.ExtraParams,
+                    ct);
+                streamOk = true;
+            }
+            finally
+            {
+                ReplyStreamEnd?.Invoke(streamOk); // 完成=移除气泡；出错/停止=冻结已显示文本
+            }
+        }
+        else
+        {
+            result = await LlamaClient.CompleteAsync(
+                ep.Url,
+                messages,
+                ep.Model,
+                temperatureOverride ?? _config.EffectiveTemperature,
+                _config.EffectiveMaxTokens,
+                ep.ApiKey,
+                ep.ExtraParams,
+                ct);
+        }
+        if (result.Usage.PromptTokens > 0)
+            OnUsageSample(result.Usage.PromptTokens, messages.Sum(m => m.Content?.Length ?? 0)); // 真实上下文 token：显示+比率校准（流式拿不到 usage 时跳过，沿用上次值）
         DebugLog?.Invoke(FormatReply(result.Text));
         return result.Text;
     }

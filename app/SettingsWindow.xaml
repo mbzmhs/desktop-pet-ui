@@ -349,7 +349,13 @@
                                   Foreground="#222" VerticalAlignment="Center"/>
                     </Grid>
 
-                    <Grid Grid.Row="18" Grid.ColumnSpan="3" Margin="0,8,0,0">
+                    <Grid Grid.Row="18" Grid.ColumnSpan="3" Margin="0,0,0,12">
+                        <CheckBox x:Name="StreamEnabledCheck"
+                                  Content="流式显示回复（聊天窗实时打字；语音与历史记录仍按整条处理。API 不支持 SSE 时取消勾选回退整包）"
+                                  Foreground="#222" VerticalAlignment="Center"/>
+                    </Grid>
+
+                    <Grid Grid.Row="19" Grid.ColumnSpan="3" Margin="0,8,0,0">
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button Content="保存全局设置" Click="OnSaveGlobal"
                                     Background="#3A7A4A" Foreground="White" BorderThickness="0" Padding="16,7" Margin="0,0,8,0"/>

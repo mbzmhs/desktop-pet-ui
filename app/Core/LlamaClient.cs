@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
@@ -40,6 +41,8 @@ public sealed record ModelInfo(string Id, int? MaxContextTokens)
 public static class LlamaClient
 {
     private static HttpClient Http = CreateClient();
+    // 流式专用：整体超时设为无限（生成可能远超 180s），生命周期由调用方 CancellationToken 控制
+    private static HttpClient StreamHttp = new(BuildProxyHandler(null)) { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
     private static string? _discoveredModel;
 
     // —— 模型上下文上限（由 /v1/models 自行提供）：保证请求不超过它而产生 API 报错 ——
@@ -128,13 +131,8 @@ public static class LlamaClient
     private static string RedactImages(string json)
         => Base64ImageRegex.Replace(json, m => "data:<image base64, " + m.Value.Length + " chars>");
 
-    private static HttpClient CreateClient()
-    {
-        var handler = new HttpClientHandler { UseProxy = true };
-        return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(180) };
-    }
-
-    public static void ConfigureProxy(ProxyConfig? cfg)
+    /// <summary>按代理设置构建 handler（普通/流式两个 client 各建一个实例，handler 不能跨 client 共享否则 Dispose 会连坐）。</summary>
+    private static HttpClientHandler BuildProxyHandler(ProxyConfig? cfg)
     {
         var mode = cfg?.Mode ?? "system";
         var handler = new HttpClientHandler();
@@ -152,10 +150,20 @@ public static class LlamaClient
         {
             handler.UseProxy = true; // 系统代理（默认）
         }
+        return handler;
+    }
+
+    private static HttpClient CreateClient() => new(BuildProxyHandler(null)) { Timeout = TimeSpan.FromSeconds(180) };
+
+    public static void ConfigureProxy(ProxyConfig? cfg)
+    {
         var old = Http;
-        Http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(180) };
+        var oldStream = StreamHttp;
+        Http = new HttpClient(BuildProxyHandler(cfg)) { Timeout = TimeSpan.FromSeconds(180) };
+        StreamHttp = new HttpClient(BuildProxyHandler(cfg)) { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
         _discoveredModel = null;
         try { old.Dispose(); } catch { }
+        try { oldStream.Dispose(); } catch { }
     }
 
     public static async Task<ChatResult> CompleteAsync(
@@ -167,7 +175,54 @@ public static class LlamaClient
         string? apiKey = null,
         string? extraParams = null,
         CancellationToken ct = default)
-        => await CompleteInternalAsync(baseUrl, messages, model, temperature, maxTokens, apiKey, extraParams, ct, retried: false);
+    => await CompleteInternalAsync(baseUrl, messages, model, temperature, maxTokens, apiKey, extraParams, ct, retried: false);
+
+    /// <summary>流式补全（SSE）：每收到一片增量就回调 onDelta(到目前为止的累计全文)，结束时返回完整 ChatResult。
+    /// usage 由 stream_options.include_usage 让服务端在尾部块携带；拿不到时 Usage 为 Empty（调用方跳过采样即可）。
+    /// 用独立的不限超时 client（StreamHttp），生命周期由 ct 控制。</summary>
+    public static async Task<ChatResult> CompleteStreamAsync(
+        string baseUrl,
+        IReadOnlyList<ChatMessage> messages,
+        string model,
+        double temperature,
+        int maxTokens,
+        Action<string> onDelta,
+        string? apiKey = null,
+        string? extraParams = null,
+        CancellationToken ct = default)
+    => await CompleteStreamInternalAsync(baseUrl, messages, model, temperature, maxTokens, apiKey, extraParams, onDelta, ct, retried: false);
+
+    /// <summary>组装 /v1/chat/completions 请求体（非流式/流式共用；stream=true 时附 stream_options.include_usage）。</summary>
+    private static string BuildChatPayload(IReadOnlyList<ChatMessage> messages, string useModel, double temperature, int maxTokens, string? extraParams, bool stream)
+    {
+        var payload = new JsonObject
+        {
+            ["model"] = useModel,
+            ["messages"] = JsonSerializer.SerializeToNode(messages.Select(ToPayload).ToArray()),
+            ["temperature"] = temperature,
+            ["max_tokens"] = maxTokens,
+            ["stream"] = stream,
+        };
+        if (stream) payload["stream_options"] = new JsonObject { ["include_usage"] = true };
+        if (!string.IsNullOrWhiteSpace(extraParams))
+        {
+            try
+            {
+                if (JsonNode.Parse(extraParams) is JsonObject extra)
+                {
+                    foreach (var kv in extra)
+                    {
+                        if (kv.Value != null) payload[kv.Key] = kv.Value.DeepClone();
+                    }
+                }
+            }
+            catch
+            {
+                // 非法 JSON 的高级参数直接忽略
+            }
+        }
+        return payload.ToJsonString();
+    }
 
     private static object ToPayload(ChatMessage m)
     {
@@ -241,34 +296,7 @@ public static class LlamaClient
         var useModel = string.IsNullOrWhiteSpace(model) ? "local" : model;
         var url = baseUrl + "/v1/chat/completions";
 
-        object[] payloadMessages = messages.Select(ToPayload).ToArray();
-
-        var payload = new JsonObject
-        {
-            ["model"] = useModel,
-            ["messages"] = JsonSerializer.SerializeToNode(payloadMessages),
-            ["temperature"] = temperature,
-            ["max_tokens"] = maxTokens,
-            ["stream"] = false,
-        };
-        if (!string.IsNullOrWhiteSpace(extraParams))
-        {
-            try
-            {
-                if (JsonNode.Parse(extraParams) is JsonObject extra)
-                {
-                    foreach (var kv in extra)
-                    {
-                        if (kv.Value != null) payload[kv.Key] = kv.Value.DeepClone();
-                    }
-                }
-            }
-            catch
-            {
-                // 非法 JSON 的高级参数直接忽略
-            }
-        }
-        var json = payload.ToJsonString();
+        var json = BuildChatPayload(messages, useModel, temperature, maxTokens, extraParams, stream: false);
         if (OnRequest != null) OnRequest(url, RedactImages(json));
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
@@ -321,6 +349,94 @@ public static class LlamaClient
             }
         }
         throw new Exception("llama.cpp 响应缺少 choices[0].message.content");
+    }
+
+    /// <summary>流式请求内部实现：SSE 逐行读 "data: {...}"，delta.content 累积后逐片回调 onDelta(累计全文)。
+    /// 尾部块携带 usage（stream_options.include_usage）；服务端在流内报 error 也按异常抛出。</summary>
+    private static async Task<ChatResult> CompleteStreamInternalAsync(
+        string baseUrl,
+        IReadOnlyList<ChatMessage> messages,
+        string model,
+        double temperature,
+        int maxTokens,
+        string? apiKey,
+        string? extraParams,
+        Action<string> onDelta,
+        CancellationToken ct,
+        bool retried)
+    {
+        baseUrl = NormalizeBaseUrl(baseUrl);
+        var useModel = string.IsNullOrWhiteSpace(model) ? "local" : model;
+        var url = baseUrl + "/v1/chat/completions";
+        var json = BuildChatPayload(messages, useModel, temperature, maxTokens, extraParams, stream: true);
+        if (OnRequest != null) OnRequest(url, RedactImages(json));
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+        if (!string.IsNullOrWhiteSpace(apiKey))
+            req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
+
+        using var resp = await StreamHttp.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            if (!retried && IsModelError(body))
+            {
+                var discovered = await DiscoverModelAsync(baseUrl, apiKey, ct);
+                if (!string.IsNullOrEmpty(discovered))
+                    return await CompleteStreamInternalAsync(baseUrl, messages, discovered, temperature, maxTokens, apiKey, extraParams, onDelta, ct, retried: true);
+            }
+            throw new Exception($"llama.cpp 流式请求失败 ({resp.StatusCode}): {Truncate(body, 300)}");
+        }
+
+        var sb = new StringBuilder();
+        int promptTokens = 0, completionTokens = 0, totalTokens = 0;
+        using var stream = await resp.Content.ReadAsStreamAsync(ct);
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        string? line;
+        while ((line = await reader.ReadLineAsync(ct)) != null)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!line.StartsWith("data:", StringComparison.Ordinal)) continue; // 跳过 event:/注释/空行
+            var data = line.Substring(5).Trim();
+            if (data == "[DONE]") break;
+
+            JsonElement root;
+            using (var doc = JsonDocument.Parse(data))
+                root = doc.RootElement.Clone();
+
+            if (root.TryGetProperty("error", out var err))
+            {
+                var msg = err.ValueKind == JsonValueKind.String ? (err.GetString() ?? err.ToString()) : err.ToString();
+                throw new Exception("llama.cpp 流式返回错误: " + Truncate(msg, 300));
+            }
+
+            // usage 可能只在尾部块出现（include_usage）
+            if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
+            {
+                if (usage.TryGetProperty("prompt_tokens", out var pt) && pt.ValueKind == JsonValueKind.Number) promptTokens = pt.GetInt32();
+                if (usage.TryGetProperty("completion_tokens", out var cpt) && cpt.ValueKind == JsonValueKind.Number) completionTokens = cpt.GetInt32();
+            }
+
+            if (root.TryGetProperty("choices", out var choices) && choices.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var choice in choices.EnumerateArray())
+                {
+                    if (!choice.TryGetProperty("delta", out var delta)) continue;
+                    if (delta.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String)
+                    {
+                        var piece = c.GetString() ?? "";
+                        if (piece.Length > 0)
+                        {
+                            sb.Append(piece);
+                            onDelta(sb.ToString()); // 交付累计全文：消费侧无需自己拼增量
+                        }
+                    }
+                }
+            }
+        }
+
+        totalTokens = promptTokens + completionTokens;
+        return new ChatResult(sb.ToString(), new ChatUsage(promptTokens, completionTokens, totalTokens));
     }
 
     private static bool IsModelError(string body)

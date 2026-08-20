@@ -328,6 +328,7 @@ ExtraParamsBox.Text = CurrentProviderExtra();
         BuildAgentScreenChecks();
         CrossFadeCheck.IsChecked = _config.Character.CrossFade;
         ReadInnerThoughtsCheck.IsChecked = _config.Chat.ReadInnerThoughts;
+        StreamEnabledCheck.IsChecked = _config.Chat.StreamEnabled;
         GlobalUserAddressBox.Text = _config.Chat.UserAddress;
         AgentCheck.IsChecked = _config.Chat.Agent.Enabled;
         AgentMaxStepsBox.Text = _config.Chat.Agent.MaxSteps.ToString();
@@ -450,6 +451,7 @@ ExtraParamsBox.Text = CurrentProviderExtra();
             _config.Chat.Proactive = ProactiveCheck.IsChecked == true;
             _config.Character.CrossFade = CrossFadeCheck.IsChecked == true;
             _config.Chat.ReadInnerThoughts = ReadInnerThoughtsCheck.IsChecked == true;
+            _config.Chat.StreamEnabled = StreamEnabledCheck.IsChecked == true;
             _config.Character.BubbleDurationSec = BubbleDurationSlider.Value;
             _config.Chat.UserAddress = GlobalUserAddressBox.Text?.Trim() ?? "";
 

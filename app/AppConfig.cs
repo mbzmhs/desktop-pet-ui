@@ -89,6 +89,8 @@ public sealed class ChatConfig
     /// <summary>上下文预算（token）：总占用（系统提示+历史）达预算时触发摘要压缩、压到 ≤70%（滞回）；聊天窗标题栏实时显示占用比。
     /// 模型接口自报的上下文上限更低时，实际预算取「上限−输出预留」与它的较小者（保证请求不超模型能力而报错）。默认 16000。</summary>
     public int ContextMaxTokens { get; set; } = 16000;
+    /// <summary>聊天流式显示（SSE）：开启后聊天窗实时打字，TTS/历史仍按整条处理；API 不支持 stream 时关掉回退整包。默认开。</summary>
+    public bool StreamEnabled { get; set; } = true;
     public int ArchiveMaxEntries { get; set; } = 5000; // 归档记录上限（条），0=无上限
     public bool Proactive { get; set; } = false;
     public double ProactiveIntervalSec { get; set; } = 30.0;
