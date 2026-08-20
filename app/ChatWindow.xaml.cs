@@ -60,7 +60,8 @@ public partial class ChatWindow : Window
     private string _streamRaw = "";        // 已收到的累计原始全文（算增量用）
     private string _streamShown = "";      // 气泡里已累计的显示文本（每片是"新释放部分"，必须追加而非替换）
     private FrameworkElement? _streamBubble; // 临时气泡元素（RebuildMessages 会清面板，需按需重挂）
-    private TextBlock? _streamText;
+    private TextBlock? _streamText;   // 纯文本正文：增量 .Text 更新（不整树重渲染→不闪）；Markdown 正式版只由历史重建换入
+    private TextBlock? _streamHeader; // "输入中…" → [tool] 收尾后改 名字+时间戳
     private bool _streamFrozen;             // 被 [tool] 抑制/出错后冻结：保留已显示文本（去光标），等正式版落历史替换
     private DateTime _frozenTs;             // 冻结时刻：重建时按它参与时间戳排序，气泡停在正确位置而不是面板末尾
     private List<AgentOpRecord> _ops = new(); // agent 操作日志（磁盘加载 + 实时事件），仅 UI 线程读写
@@ -440,7 +441,9 @@ public partial class ChatWindow : Window
             var piece = soFar[_streamRaw.Length..];
             _streamRaw = soFar;
 
-            UpdateStreamBubble(_streamFilter.Feed(piece));
+            var released = _streamFilter.Feed(piece);
+            if (released.Length == 0) return; // [tool] 块被吞 / 标签扣留中：显示无变化，跳过更新免无效布局
+            UpdateStreamBubble(released);
         }));
     }
 
@@ -460,16 +463,15 @@ public partial class ChatWindow : Window
             }
             else if (_streamText != null)
             {
+                var shown = ToDisplay(_streamShown).Trim();
+                if (shown.Length == 0) { RemoveStreamBubble(); return; } // 纯工具块调用（整条回复无正文）：不留空气泡
                 _streamFrozen = true;
                 _frozenTs = DateTime.Now; // 重建时按此时刻排序（早于同一步的自动放行记录）
-                // [tool] 后剩余全是隐藏 JSON，正文此刻已完整：直接换成 Markdown 渲染的正式版气泡
-                // （与工具执行完 OnMessage 落历史后的样式一致），不再保留纯文本冻结态
+                // 正文已完整（[tool] 块已被过滤器吞掉，块两侧正文都在）：去光标冻结纯文本 + 头注改 名字+时间戳。
+                // 不做 MarkdownRenderer 整树替换（会闪）；Markdown 正式版由工具执行完 OnMessage 落历史的重建自然换入
+                _streamText.Text = shown;
                 var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
-                if (_streamBubble != null && _streamBubble.Parent != null) MsgPanel.Children.Remove(_streamBubble);
-                var rendered = BuildBubble(false, name, _frozenTs, ToDisplay(_streamShown));
-                MsgPanel.Children.Add(rendered); // 重建时按 _frozenTs 归位；正式版落历史后由 replaced 检查移除
-                _streamBubble = rendered;
-                _streamText = null;
+                if (_streamHeader != null) _streamHeader.Text = name + "  " + _frozenTs.ToString("MM-dd HH:mm");
             }
             _streamFilter = null;
             _streamRaw = "";
@@ -478,6 +480,8 @@ public partial class ChatWindow : Window
 
     private void UpdateStreamBubble(string releasedText)
     {
+        // Feed 返回的是"本片新释放的片段"，要追加到已累计文本后面
+        _streamShown += releasedText ?? "";
         // RebuildMessages 可能刚清过面板：气泡不在树上就重新挂到末尾
         if (_streamBubble == null || _streamBubble.Parent == null)
         {
@@ -495,6 +499,13 @@ public partial class ChatWindow : Window
                 Padding = new Thickness(10, 7, 10, 7),
                 Child = _streamText,
             };
+            _streamHeader = new TextBlock
+            {
+                Text = name + "  输入中…",
+                FontSize = 10.5,
+                Foreground = MakeBrush("#777"),
+                Margin = new Thickness(2, 2, 2, 0),
+            };
             var stack = new StackPanel
             {
                 HorizontalAlignment = HorizontalAlignment.Left,
@@ -502,19 +513,13 @@ public partial class ChatWindow : Window
                 Margin = new Thickness(0, 5, 0, 5),
             };
             stack.Children.Add(bubble);
-            stack.Children.Add(new TextBlock
-            {
-                Text = name + "  输入中…",
-                FontSize = 10.5,
-                Foreground = MakeBrush("#777"),
-                Margin = new Thickness(2, 2, 2, 0),
-            });
+            stack.Children.Add(_streamHeader);
             _streamBubble = stack;
             MsgPanel.Children.Add(stack);
         }
-        // 打字光标：尾部加闪烁块（纯文本，流结束即移除）。Feed 返回的是"本片新释放的片段"，要追加到已累计文本后面
-        _streamShown += releasedText ?? "";
-        _streamText!.Text = _streamShown + "▍";
+        // 打字光标：尾部加闪烁块（纯文本，收尾即移除）。
+        // TrimEnd：纯 TextBlock 会把尾部 \n\n 渲染成真实空行，裁掉尾空白与正式版观感一致
+        _streamText!.Text = _streamShown.TrimEnd() + "▍";
         ScrollToEnd();
     }
 
@@ -524,6 +529,7 @@ public partial class ChatWindow : Window
             MsgPanel.Children.Remove(_streamBubble);
         _streamBubble = null;
         _streamText = null;
+        _streamHeader = null;
         _streamFrozen = false;
     }
 
@@ -987,10 +993,9 @@ public partial class ChatWindow : Window
             if (rm.Success && !string.IsNullOrWhiteSpace(rm.Groups[1].Value))
                 text += " · " + rm.Groups[1].Value;
 
-            // [tool] 之前的正文（模型的角色语气开场白，如"[happy]好的主人～…"）：流式打字时用户已读到它，
-            // 重建后必须保留显示（剥情绪标签），否则"打到最后突然消失"。放在紧凑工具行上方。
-            var toolIdx = c.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase);
-            if (toolIdx > 0) _prose = ToDisplay(c[..toolIdx]);
+            // [tool] 块两侧的正文（剥工具块+情绪标签）：模型可能先写开场白再发块，也可能先发明确/高危工具块
+            // 再在 [/tool] 之后补确认提问——只取块前会丢后半段。放在紧凑工具行上方。
+            _prose = ToDisplay(AgentRunner.StripToolBlocks(c));
         }
 
         const int collapsedLen = 120;

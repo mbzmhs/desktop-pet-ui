@@ -151,22 +151,20 @@ public sealed class ChatPipeline : IDisposable
         };
         // agent 循环每步也带 system+完整历史，其 usage 同样代表上下文占用（显示与比率校准）
         _agent.OnUsage = (pt, sc) => OnUsageSample(pt, sc);
-        // agent 各步流式增量 → 聊天窗打字气泡；[tool] 门控：累计文本一旦出现 [tool] 就是中间工具步，
-        // 立即收尾气泡且不再转发（最终纯文字回答不含 [tool]，情绪标签 [happy] 之类不受影响照常流）
+        // agent 各步流式增量 → 聊天窗打字气泡。[tool] 块由 StreamTagFilter 按区间吞掉（工具可在头部/中部/尾部，
+        // 块两侧的正文照常放行显示）；这里只记录"本步含工具"，供流结束时决定 End(false) 还是 End(true)
         _agent.OnStreamDelta = soFar =>
         {
-            // 每条流的累计文本从零开始，_agentStreamSuppressed 随新流自然复位（首片不含 [tool]）
-            if (soFar.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                if (!_agentStreamSuppressed) { _agentStreamSuppressed = true; ReplyStreamEnd?.Invoke(false); } // 中间工具步：冻结已显示文本，后续片静默丢弃（只收尾一次）
-            }
-            else
-            {
-                _agentStreamSuppressed = false;
-                ReplyDelta?.Invoke(soFar);
-            }
+            if (!_agentStreamSuppressed && soFar.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
+                _agentStreamSuppressed = true; // 本步是中间工具步（最终纯文字回答不含 [tool]，情绪标签不受影响）
+            ReplyDelta?.Invoke(soFar);
         };
-        _agent.OnStreamEnd = completed => ReplyStreamEnd?.Invoke(completed && !_agentStreamSuppressed); // 正常完成且未被抑制=true
+        _agent.OnStreamEnd = completed =>
+        {
+            var toolStep = _agentStreamSuppressed;
+            _agentStreamSuppressed = false; // 本步流结束：复位给下一步的新流
+            ReplyStreamEnd?.Invoke(completed && !toolStep); // 正常完成且非工具步=true（移除气泡）；工具步/出错=false（冻结收尾）
+        };
         _agent.TokPerCharProvider = () => TokPerChar; // 硬护栏裁剪用同一校准比率
     }
 

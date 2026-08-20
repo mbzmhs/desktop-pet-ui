@@ -76,6 +76,7 @@ public sealed class StreamTagFilter
 
     private readonly HashSet<string> _known;
     private string _pending = "";
+    private bool _inToolBlock; // 处于 [tool]...[/tool] 内：整段吞掉（工具 JSON 不进显示）；块外正文照常放行
 
     public StreamTagFilter(IEnumerable<string>? knownEmotions)
     {
@@ -94,8 +95,31 @@ public sealed class StreamTagFilter
         var released = "";
         while (_pending.Length > 0)
         {
+            if (_inToolBlock)
+            {
+                // [tool] 可能在回复任何位置（头部常见：高危工具先发块再问确认）——只吞到 [/tool]，之后的正文继续放行
+                var close = _pending.IndexOf("[/tool]", StringComparison.OrdinalIgnoreCase);
+                if (close >= 0)
+                {
+                    _pending = _pending[(close + "[/tool]".Length)..];
+                    _inToolBlock = false;
+                    continue; // 闭合后可能有正文或情感标签，继续扫
+                }
+                var keep = Math.Min(_pending.Length, 6); // 尾部可能是半截 "[/tool"（至多 6 字符），其余全吞
+                _pending = keep > 0 ? _pending[^keep..] : "";
+                break;
+            }
+
             var lb = _pending.IndexOf('[');
             if (lb < 0) { released += _pending; _pending = ""; break; } // 无未决 '['：全部释放
+
+            if (_pending[lb..].StartsWith("[tool]", StringComparison.OrdinalIgnoreCase))
+            {
+                released += _pending[..lb]; // 块前的正文
+                _pending = _pending[(lb + "[tool]".Length)..];
+                _inToolBlock = true;        // 吞到 [/tool]（不完整块由 Flush 丢弃）
+                continue;
+            }
 
             var rb = _pending.IndexOf(']', lb + 1);
             if (rb >= 0 && IsKnownTag(_pending, lb, rb))
@@ -126,6 +150,12 @@ public sealed class StreamTagFilter
     /// <summary>流结束：剩余扣留部分剥离所有完整已知标签后整体返回（未知 '[' 序列原样显示）。</summary>
     public string Flush()
     {
+        if (_inToolBlock)
+        {
+            _pending = "";
+            _inToolBlock = false;
+            return ""; // 未闭合的工具块：丢弃剩余（不完整调用，展示原始 JSON 无意义）
+        }
         var s = _pending;
         _pending = "";
         if (s.Length == 0) return "";
