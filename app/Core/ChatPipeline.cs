@@ -792,10 +792,10 @@ public sealed class ChatPipeline : IDisposable
 
     private async Task MaybeCompressAsync(CancellationToken ct = default)
     {
-        var max = _config.Chat.ContextLength;
-        // 有效预算（用户设置 ∩ 模型实际上限）→ 字数预算（校准比率折算，未校准时默认 ~1.5 字/token）：压缩发生在请求前，只能用本地估算
+        // 有效预算（用户设置 ∩ 模型实际上限）→ 字数预算（校准比率折算，未校准时默认 ~1.5 字/token）：压缩发生在请求前，只能用本地估算。
+        // 只按 token 预算触发，不按消息条数——agent 一个任务就产生大量往返消息，条数阈值会频繁误触发
         var maxChars = EffectiveContextBudget() > 0 ? (int)(EffectiveContextBudget() / TokPerChar) : 0;
-        if (max <= 0 && maxChars <= 0) return;
+        if (maxChars <= 0) return;
 
         List<ChatMessage> snap;
         lock (_histLock) snap = _history.ToList();
@@ -804,20 +804,17 @@ public sealed class ChatPipeline : IDisposable
         // 预算覆盖整次请求（系统提示词+历史），与聊天窗标题栏显示一致——usage.prompt_tokens 是整请求量，
         // 若只按历史比较，系统提示词（几千 token）会造成"显示已超预算却不触发压缩"的偏移
         var sysChars = _lastSystemChars;
-        var overflowCount = max > 0 ? count - max : 0;
-        var overflowChars = maxChars > 0 ? totalChars + sysChars - maxChars : 0;
-        if (overflowCount < 2 && overflowChars <= 0) return;
+        if (totalChars + sysChars - maxChars <= 0) return;
 
         // 最小必要压缩：只压到剩余（系统+历史）≤ 预算的 70%（滞回，避免每轮反复压），绝不碰最近几轮
-        var targetCount = max > 0 ? (int)(max * 0.7) : int.MaxValue;
-        var targetChars = maxChars > 0 ? Math.Max(0, (long)(maxChars * 0.7) - sysChars) : long.MaxValue;
+        var targetChars = Math.Max(0, (long)(maxChars * 0.7) - sysChars);
         var prefix = new long[count + 1];
         for (var i = 0; i < count; i++) prefix[i + 1] = prefix[i] + (snap[i].Content?.Length ?? 0);
 
         int take = -1;
         for (var t = Math.Min(4, count - 2); t <= count - 2; t++)
         {
-            if (count - t <= targetCount && totalChars - prefix[t] <= targetChars) { take = t; break; }
+            if (totalChars - prefix[t] <= targetChars) { take = t; break; }
         }
         if (take < 0) take = count - 2; // 仍超预算：压到只剩最后两条
         if (take < 2 || count - take < 2) return;

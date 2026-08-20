@@ -290,22 +290,16 @@
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="14"/>
                             <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="14"/>
-                            <ColumnDefinition Width="*"/>
                         </Grid.ColumnDefinitions>
                         <StackPanel Grid.Column="0">
-                            <TextBlock Text="对话上下文长度（条）" Foreground="#444" Margin="0,0,0,4"/>
-                            <TextBox x:Name="ContextLengthBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
-                        </StackPanel>
-                        <StackPanel Grid.Column="2">
                             <TextBlock Text="主动搭话间隔（秒）" Foreground="#444" Margin="0,0,0,4"/>
                             <TextBox x:Name="ProactiveIntervalBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
                         </StackPanel>
-                        <StackPanel Grid.Column="4">
+                        <StackPanel Grid.Column="2">
                             <TextBlock Text="立绘空闲换图间隔（秒）" Foreground="#444" Margin="0,0,0,4"/>
                             <TextBox x:Name="IdleIntervalBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
                         </StackPanel>
-                        <StackPanel Grid.Column="6">
+                        <StackPanel Grid.Column="4">
                             <TextBlock Text="气泡预留高度（像素）" Foreground="#444" Margin="0,0,0,4"/>
                             <TextBox x:Name="BubbleReserveBox" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
                         </StackPanel>

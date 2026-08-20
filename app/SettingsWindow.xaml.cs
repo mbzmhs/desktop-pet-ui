@@ -318,7 +318,6 @@ ExtraParamsBox.Text = CurrentProviderExtra();
         ProxyAddressBox.IsEnabled = string.Equals(_config.Chat.Proxy.Mode, "custom", StringComparison.OrdinalIgnoreCase);
         TtsUrlBox.Text = _config.Chat.Tts.Url ?? "";
         TtsStreamingCheck.IsChecked = _config.Chat.Tts.Streaming;
-        ContextLengthBox.Text = _config.Chat.ContextLength.ToString();
         ContextMaxTokensBox.Text = _config.Chat.ContextMaxTokens.ToString();
         ArchiveMaxEntriesBox.Text = _config.Chat.ArchiveMaxEntries.ToString();
         ProactiveIntervalBox.Text = _config.Chat.ProactiveIntervalSec.ToString("0.###");
@@ -435,8 +434,6 @@ ExtraParamsBox.Text = CurrentProviderExtra();
             if (!string.IsNullOrWhiteSpace(TtsUrlBox.Text)) _config.Chat.Tts.Url = TtsUrlBox.Text.Trim();
             _config.Chat.Tts.Streaming = TtsStreamingCheck.IsChecked == true;
 
-            if (int.TryParse(ContextLengthBox.Text?.Trim(), out var cl) && cl > 0)
-                _config.Chat.ContextLength = cl;
             if (int.TryParse(ContextMaxTokensBox.Text?.Trim(), out var cmt) && cmt >= 0)
                 _config.Chat.ContextMaxTokens = cmt;
             if (int.TryParse(ArchiveMaxEntriesBox.Text?.Trim(), out var ame) && ame >= 0)

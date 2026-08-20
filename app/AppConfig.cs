@@ -85,7 +85,6 @@ public sealed class ChatConfig
     public bool ReadInnerThoughts { get; set; } = false; // 是否朗读 （）() 和 【】 内的内心想法/小动作；false 时发送给 TTS 的文本剔除括号内容
     public ChatHotkeyConfig Hotkey { get; set; } = new();
     public ChatUiConfig Ui { get; set; } = new();
-    public int ContextLength { get; set; } = 80;
     /// <summary>上下文预算（token）：总占用（系统提示+历史）达预算时触发摘要压缩、压到 ≤70%（滞回）；聊天窗标题栏实时显示占用比。
     /// 模型接口自报的上下文上限更低时，实际预算取「上限−输出预留」与它的较小者（保证请求不超模型能力而报错）。默认 16000。</summary>
     public int ContextMaxTokens { get; set; } = 16000;
