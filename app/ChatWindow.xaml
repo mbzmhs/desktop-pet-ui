@@ -6,45 +6,69 @@
         AllowsTransparency="True"
         Background="Transparent"
         ShowInTaskbar="False"
-        ResizeMode="NoResize"
+        ResizeMode="CanResizeWithGrip"
         Topmost="True"
         ShowActivated="True">
     <Border x:Name="Shell"
-            Background="#EE1E1E1E"
+            Background="#EE202226"
             CornerRadius="10"
             BorderThickness="1"
             BorderBrush="#555"
-            Padding="12">
-        <DockPanel>
-            <TextBlock x:Name="HintText" Text="和宠物说点什么…" Foreground="#888" FontSize="12"
-                       DockPanel.Dock="Top" Margin="0,0,0,6"/>
-            <TextBox x:Name="InputBox" DockPanel.Dock="Top"
-                     Background="#222"
-                     Foreground="#EEE"
-                     BorderBrush="#444"
-                     BorderThickness="1"
-                     FontSize="15"
-                     Padding="6,5"
-                     VerticalContentAlignment="Center"
-                     MaxLength="500"/>
-            <TextBlock x:Name="StatusText" Foreground="#AAA" FontSize="12"
-                       DockPanel.Dock="Bottom"
-                       Margin="0,6,0,0" TextWrapping="Wrap" MinHeight="16"/>
-            <ScrollViewer x:Name="HistoryScroll" Margin="0,8,0,0"
+            Padding="10,8">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <!-- 标题栏（拖动移动窗口） -->
+            <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent" MouseLeftButtonDown="OnTitleBarMouseDown">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="10" Height="10" Fill="#E0A0F0" Margin="0,0,6,0"/>
+                    <TextBlock x:Name="TitleText" Text="聊天" FontSize="14" FontWeight="SemiBold"
+                               Foreground="#DDD" VerticalAlignment="Center"/>
+                </StackPanel>
+                <Button x:Name="CloseBtn" Grid.Column="1" Content="✕" Click="OnCloseClick"
+                        Background="Transparent" Foreground="#AAA" BorderThickness="0"
+                        FontSize="14" Padding="6,2" Cursor="Hand" VerticalAlignment="Top"/>
+            </Grid>
+            <!-- 消息流 -->
+            <ScrollViewer x:Name="MsgScroll" Grid.Row="1" Margin="0,8,0,0"
                           VerticalScrollBarVisibility="Auto"
                           HorizontalScrollBarVisibility="Disabled">
-                <ItemsControl x:Name="HistoryList">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate>
-                            <StackPanel Margin="0,2">
-                                <TextBlock Text="{Binding Header}" FontSize="11" Foreground="{Binding HeaderColor}"/>
-                                <TextBlock Text="{Binding Content}" FontSize="13" Foreground="#EEE"
-                                           TextWrapping="Wrap" Margin="0,1,0,0"/>
-                            </StackPanel>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
+                <StackPanel x:Name="MsgPanel"/>
             </ScrollViewer>
-        </DockPanel>
+            <!-- 状态 + 输入行 -->
+            <TextBlock x:Name="StatusText" Grid.Row="2" Foreground="#888" FontSize="11.5"
+                       Margin="0,6,0,0" TextWrapping="Wrap" MinHeight="14"/>
+            <Grid x:Name="InputRow" Grid.Row="3">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBox x:Name="InputBox"
+                         Background="#2A2D33"
+                         Foreground="#EEE"
+                         CaretBrush="#EEE"
+                         BorderBrush="#444"
+                         BorderThickness="1"
+                         FontSize="14"
+                         Padding="6,5"
+                         AcceptsReturn="True"
+                         TextWrapping="Wrap"
+                         MinHeight="38"
+                         MaxHeight="96"
+                         VerticalScrollBarVisibility="Auto"
+                         KeyDown="OnInputKeyDown"/>
+                <Button x:Name="SendBtn" Grid.Column="1" Content="发送" Click="OnSendClick"
+                        Background="#3D7EBF" Foreground="White" BorderThickness="0"
+                        FontSize="14" Padding="14,5" Margin="8,0,0,0" Cursor="Hand"/>
+            </Grid>
+        </Grid>
     </Border>
 </Window>

@@ -6,6 +6,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using DesktopPetUi.Core.Agent;
 
 namespace DesktopPetUi.Core;
 
@@ -20,31 +21,50 @@ public sealed class ChatPipeline : IDisposable
     private readonly AppConfig _config;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly List<ChatMessage> _history = new();
+    private readonly object _histLock = new(); // 历史会在 agent 线程池线程上修改，UI 线程并发读取（聊天窗重建消息），必须加锁
+    private readonly AgentRunner _agent;
+    private Action<string>? _debugLog;
     private string? _summary;
     private string? _lastProactive;
-    private string? _screenNote;
     private HashSet<string>? _availableEmotions;
     private DateTime _emotionsFetchedAt;
 
-    private static readonly string[] Weekdays = { "日", "一", "二", "三", "四", "五", "六" };
-    private static readonly string[] WeekdaysJa = { "日曜日", "月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日" };
     private static readonly string[] WeekdaysEn = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 
     public Action<string>? Status { get; set; }
-    public Action<string>? DebugLog { get; set; }
+    /// <summary>每次组装出最终系统提示词时回调（调试窗口展示用）。</summary>
+    public Action<string>? SystemPromptDebug { get; set; }
+    public Action<string>? DebugLog
+    {
+        get => _debugLog;
+        set
+        {
+            _debugLog = value;
+            _agent.DebugLog = value;
+        }
+    }
     public event Action? HistoryChanged;
     public bool IsRunning { get; private set; }
 
-    public IReadOnlyList<ChatMessage> History => _history;
+    /// <summary>线程安全的历史快照（加锁拷贝），UI 线程可放心遍历。</summary>
+    public IReadOnlyList<ChatMessage> History { get { lock (_histLock) return _history.ToList(); } }
     public string? Summary => _summary;
-    public string? ScreenNote => _screenNote;
+    /// <summary>TTS 端可用自定义情感（显示层剥离情绪标签用）；null=尚未获取。</summary>
+    public HashSet<string>? AvailableEmotions => _availableEmotions;
 
-    public ChatPipeline(AppConfig config) => _config = config;
+    public ChatPipeline(AppConfig config)
+    {
+        _config = config;
+        _agent = new AgentRunner(config);
+    }
 
     public void Restore(string? summary, IEnumerable<ChatMessage> history)
     {
-        _history.Clear();
-        _history.AddRange(Sanitize(history));
+        lock (_histLock)
+        {
+            _history.Clear();
+            _history.AddRange(Sanitize(history));
+        }
         _summary = string.IsNullOrWhiteSpace(summary) ? null : summary;
         HistoryChanged?.Invoke();
     }
@@ -69,59 +89,97 @@ public sealed class ChatPipeline : IDisposable
         return clean;
     }
 
+    /// <summary>
+    /// 系统提示词组装。顺序 = 缓存友好度：稳定段在前（最大化 LLM 前缀缓存命中），
+    /// 每轮都会变化的易变段（后台任务、当前时间）放最后。
+    /// </summary>
     private string BuildSystemContent()
     {
         var parts = new List<string>();
+        // —— 稳定前缀 ——
         if (!string.IsNullOrWhiteSpace(_config.EffectiveSystemPrompt))
             parts.Add(_config.EffectiveSystemPrompt);
         var lang = CharacterLang();
         parts.Add(lang == "ja"
-            ? "【言語ルール】ユーザーがどの言語で話しかけても、あなたは必ず日本語で返答してください。絶対にユーザーの言語に合わせてはいけません。"
+            ? "LANGUAGE: Always reply in Japanese, no matter what language the user speaks. NEVER switch to the user's language."
             : lang == "en"
-                ? "【Language rule】No matter what language the user speaks, always reply in English. Never switch to the user's language."
-                : "【语言规则】无论用户用什么语言说话，你都必须用中文回复，绝不能跟着用户换语言。");
-        var now = DateTime.Now;
-        if (lang == "ja")
-        {
-            parts.Add("【現在時刻】現在は" + now.ToString("yyyy年M月d日") + "（" + WeekdaysJa[(int)now.DayOfWeek] + "）" + now.ToString("HH:mm") + "です。");
-        }
-        else if (lang == "en")
-        {
-            parts.Add("【Current time】It is " + now.ToString("yyyy-MM-dd") + " (" + WeekdaysEn[(int)now.DayOfWeek] + ") " + now.ToString("HH:mm") + ".");
-        }
-        else
-        {
-            parts.Add("【当前时间】" + now.ToString("yyyy年M月d日") + " 星期" + Weekdays[(int)now.DayOfWeek] + " " + now.ToString("HH:mm"));
-        }
+                ? "LANGUAGE: Always reply in English, no matter what language the user speaks. NEVER switch to the user's language."
+                : "LANGUAGE: Always reply in Chinese (Simplified), no matter what language the user speaks. NEVER switch to the user's language.");
         var address = _config.EffectiveUserAddress;
         if (!string.IsNullOrWhiteSpace(address))
-        {
-            parts.Add(lang == "ja"
-                ? "【ユーザーの呼び方】ユーザーのことを「" + address + "」と呼んでください。"
-                : lang == "en"
-                    ? "【Addressing the user】Address the user as \"" + address + "\"."
-                    : "【对用户的称呼】请用「" + address + "」来称呼用户。");
-        }
-        if (!string.IsNullOrWhiteSpace(_screenNote))
-        {
-            parts.Add(lang == "ja"
-                ? "【今観察しているユーザーのデスクトップ画面】\n" + Truncate(_screenNote, 400)
-                : lang == "en"
-                    ? "【What the pet currently observes on the user's desktop】\n" + Truncate(_screenNote, 400)
-                    : "【宠物此刻观察到的用户桌面画面】\n" + Truncate(_screenNote, 400));
-        }
+            parts.Add("ADDRESSING: Address the user as \"" + address + "\".");
         if (!string.IsNullOrWhiteSpace(_summary))
+            parts.Add("MEMORY (summary of earlier conversations — already in the past, not just now): You may reference it to stay in character, but ALWAYS prioritize the current conversation.\n" + _summary);
+        if (_config.Chat.Agent.Enabled)
         {
-            parts.Add(lang == "ja"
-                ? "【過去の記憶まとめ】以下はもっと前の会話の記憶要約で、既に過ぎ去った過去の出来事です。直前に起きたことではありません。キャラを保つために引用しても構いませんが、現在の会話を優先してください。\n" + _summary
-                : lang == "en"
-                    ? "【Memory summary from the past】The following is a summary of memories from earlier conversations; these are already in the past, not just now. You may reference it to stay in character, but prioritize the current conversation.\n" + _summary
-                    : "【过去的记忆摘要】以下是更早之前对话的记忆摘要，属于已经过去的事，不是刚刚发生的。可以引用它延续人设，但请以当前对话为准。\n" + _summary);
+            var pathLine = AgentPathsLine(_config);
+            if (!string.IsNullOrWhiteSpace(pathLine)) parts.Add(pathLine);
+            parts.Add(AgentToolLine());
         }
-        var emoLine = AvailableEmotionLine(lang);
+        var emoLine = AvailableEmotionLine();
         if (!string.IsNullOrWhiteSpace(emoLine))
             parts.Add(emoLine);
+        // —— 易变尾部（每轮变化，放最后以最小化缓存失效范围）——
+        if (_config.Chat.Agent.Enabled)
+        {
+            JobManager.Prune();
+            var jobLine = JobManager.ActiveSummary();
+            if (!string.IsNullOrWhiteSpace(jobLine)) parts.Add(jobLine);
+        }
+        // 只到日期（不带时分）：时分每轮都变，会击穿前缀缓存；模型需要精确时间时会自己问/用工具查
+        var now = DateTime.Now;
+        parts.Add("CURRENT TIME: " + now.ToString("yyyy-MM-dd") + " (" + WeekdaysEn[(int)now.DayOfWeek] + ")");
         return string.Join("\n\n", parts);
+    }
+
+    /// <summary>Agent 工具协议（仅 agent 开启时注入）。英文书写以最大化指令遵循；回复语言由 LANGUAGE 段控制。</summary>
+    private static string AgentToolLine()
+    {
+        return "[AGENT MODE] You can operate this computer on the user's behalf via tools.\n" +
+               "PROTOCOL (follow EXACTLY):\n" +
+                "- To call a tool, put ONE line in your reply: [tool]{\"name\":\"tool_name\",\"risk\":\"low|medium|high\",\"args\":{...}}[/tool] — at most ONE [tool] line per reply. You may add one short in-character sentence about what you are doing, then WAIT for the [result] message before continuing.\n" +
+                "- A reply WITHOUT a [tool] line ENDS the task. Therefore: if you still need to do anything (search, read, run, create...), this reply MUST contain the [tool] line — NEVER just say \"let me look/try/check\" and stop without calling the tool. Reserve tool-free replies for final answers or when no action is needed.\n" +
+                "- Example: [tool]{\"name\":\"list_dir\",\"risk\":\"low\",\"args\":{\"path\":\"C:\\\\Users\\\\me\\\\Desktop\"}}[/tool]\n" +
+                "- NEVER put tool parameters (command, path, url, ...) at the top level. ALL parameters MUST go inside the \"args\" object. WRONG: {\"name\":\"run_powershell\",\"command\":\"dir\"}. RIGHT: {\"name\":\"run_powershell\",\"risk\":\"low\",\"args\":{\"command\":\"dir\",\"read_only\":true}}\n" +
+                "- risk = your self-assessed danger level: low=read-only/no side effect, medium=creating new content, high=delete/overwrite/irreversible. When in doubt, rate HIGHER. The system grades independently and may ask the user to confirm; if the user declines, do NOT retry.\n" +
+               "- Do not use tools for plain conversation.\n" +
+               "AVAILABLE TOOLS:\n" +
+               "- read_file(path): read a file (line limit applies)\n" +
+               "- list_dir(path?): list directory contents\n" +
+               "- search_files(name_pattern, root_dir?, max_results?): wildcard(* ?) filename search, e.g. *.mp3\n" +
+               "- write_file(path, content): write a FILE's full content — creates it if missing, overwrites if existing (overwriting asks the user first). Files only, NEVER for directories.\n" +
+               "- edit_file(path, old_string, new_string): replace one exact snippet in an EXISTING file (old_string must match the file exactly and be unique; ALWAYS prefer this over rewriting whole files with write_file)\n" +
+               "- delete_file(path): delete a file/folder (always requires user consent)\n" +
+               "- search_content(pattern, root_dir?, max_results?): regex content search across files (case-insensitive), returns path:lineNo:line\n" +
+               "- web_fetch(url): fetch a web page's main text (http/https only, intranet addresses blocked; plain text, length-capped)\n" +
+               "- ask_user(question): ask the user a question and wait for their typed answer (only when you genuinely need info or a choice; never ask what you can find out yourself)\n" +
+               "- run_powershell(command, read_only, paths?): run PowerShell synchronously (tasks finishing within ~60s). read_only=true means read-only query. paths = array of ABSOLUTE file/dir paths the command reads/writes — list ALL of them; omitting some is safe (worst case: one extra confirm dialog)\n" +
+               "- start_powershell(command, read_only, paths?): start a long task in background, returns a job id (use for tasks likely over 1 minute; paths as above)\n" +
+               "- check_job(job_id): check a background job's progress and output\n" +
+               "- observe_screen(): capture screenshots of the user's screens and view them. When the user asks what is on their screen / what they are looking at, ALWAYS call this FIRST and answer based only on what you actually see in the images.\n" +
+               "HARD RULES:\n" +
+               "- To create an empty DIRECTORY, use run_powershell with `New-Item -ItemType Directory` (or mkdir); NEVER use write_file for directories.\n" +
+               "- NEVER invent file paths. Before write_file/edit_file/delete_file/search_content, verify the path exists with list_dir or search_files.\n" +
+               "- If a tool returns an error, do NOT retry the identical call; fix the problem (e.g. list the directory to find the exact name) or tell the user what failed.";
+    }
+
+    /// <summary>工作目录 + 少量已知位置（只给桌面和用户目录，其余位置让模型自己查，不给它猜的素材）。</summary>
+    private static string AgentPathsLine(AppConfig cfg)
+    {
+        var workDir = AgentTools.ResolveWorkDir(cfg);
+        var (home, desktop, _, _) = AgentTools.KnownFolders();
+        if (string.IsNullOrWhiteSpace(home)) return "";
+        var parts = new List<string> { "WORKING DIRECTORY: " + workDir + " — base for relative paths and PowerShell; file operations there follow the working-dir permission setting. If the user does not specify a path, ALWAYS use this working directory as the root (create/read/list files under it), never elsewhere." };
+        var entries = new List<string>();
+        void Add(string label, string? path)
+        {
+            if (!string.IsNullOrWhiteSpace(path)) entries.Add(label + ": " + path);
+        }
+        Add("User profile", home);
+        Add("Desktop", desktop);
+        if (entries.Count > 0) parts.Add("COMMON FOLDERS — " + string.Join(". ", entries) + ".");
+        parts.Add("When the user refers to \"desktop\" or their user folder, use the paths above directly. For ANY other location (documents, downloads, etc.), do NOT guess paths — determine them yourself first (e.g. run_powershell `[Environment]::GetFolderPath('MyDocuments')`, or search_files/list_dir).");
+        return string.Join("\n", parts);
     }
 
     /// <summary>角色语言：优先用 TTS 的 text_lang（zh/ja/en），未明确时按系统提示词内容推断。</summary>
@@ -164,15 +222,11 @@ public sealed class ChatPipeline : IDisposable
         }
     }
 
-    private string? AvailableEmotionLine(string lang)
+    private string? AvailableEmotionLine()
     {
         var emotions = CharacterEmotions() ?? ChatEmotion.Emotions;
         var list = string.Join(" ", emotions.Select(x => "[" + x + "]"));
-        return lang == "ja"
-            ? "【感情タグ】返答は必ず感情タグで始めてください（例：「[happy]こんにちは！」）。タグは読み上げられず、立ち絵の感情切り替えにのみ使われます。会話途中で感情を変える場合も、その位置にタグを挿入してください。文末にはタグを付けないでください（無効）。1回の返答につき1〜3個で十分です。使えるタグ：" + list
-            : lang == "en"
-                ? "【Emotion tags】Your reply MUST start with an emotion tag (e.g. '[happy]Hello!'). Tags are not read aloud and only switch the character's expression mid-speech. To change emotion mid-speech, insert a tag at that point. Do not append a tag at the end (ignored). 1-3 tags per reply is enough. Available tags: " + list
-                : "【情感标签】回复必须以一个情感标签开头（例如「[happy]你好呀！」）。标签不会被朗读，只在说话中途切换立绘情绪。中途要切换情绪时，在切换位置插入标签即可。结尾不要加标签（无效），每次回复 1~3 个即可。只能从以下可选标签中选择：" + list;
+        return "EMOTION TAGS: Your reply MUST start with an emotion tag (e.g. '[happy]Hello!'). Tags are not read aloud and only switch the character's expression mid-speech; to change emotion mid-speech, insert a tag at that point. Do NOT append a tag at the end (ignored). 1-3 tags per reply is enough. Available tags: " + list;
     }
 
     private async Task EnsureEmotionsAsync()
@@ -191,50 +245,6 @@ public sealed class ChatPipeline : IDisposable
             DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] 可用情感: " + string.Join(", ", _availableEmotions.OrderBy(x => x)));
     }
 
-    public async Task<string?> ObserveScreenAsync()
-    {
-        try
-        {
-            var image = await Task.Run(() => ScreenCapture.CaptureCursorScreenAsBase64());
-            if (string.IsNullOrEmpty(image)) return null;
-            var lang = _config.EffectiveTextLang;
-            string sysObs, userObs;
-            if (lang == "ja")
-            {
-                sysObs = "あなたはユーザーのデスクトップの様子を観察するペットです。";
-                userObs = "この画面画像に何が表示されているか簡潔に説明してください。開いているアプリ、テキスト、状況など具体的に。日本語で2〜3文。";
-            }
-            else if (lang == "en")
-            {
-                sysObs = "You are a pet assistant observing the user's desktop.";
-                userObs = "Briefly describe what is shown in this screenshot. Mention open apps, text, and context specifically. 2-3 sentences in English.";
-            }
-            else
-            {
-                sysObs = "你是一个观察用户桌面的宠物助手。";
-                userObs = "请简要描述这张屏幕截图里的内容。具体说明打开的应用程序、文字和大致情况。用简体中文，2到3句。";
-            }
-            var messages = new List<ChatMessage>
-            {
-                new() { Role = "system", Content = sysObs },
-                new() { Role = "user", Content = userObs },
-            };
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-            var ep = _config.EffectiveLlm();
-            var desc = await LlamaClient.CompleteVisionAsync(
-                ep.Url, messages, image,
-                ep.Model, 0.2, 300, ep.ApiKey, ep.ExtraParams, cts.Token);
-            _screenNote = Truncate(desc, 400);
-            DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] 观察桌面: " + _screenNote);
-            return _screenNote;
-        }
-        catch (Exception ex)
-        {
-            Log.Error("ObserveScreenAsync failed", ex);
-            return null;
-        }
-    }
-
     private static string Truncate(string s, int max)
     {
         if (string.IsNullOrEmpty(s) || s.Length <= max) return s ?? "";
@@ -247,11 +257,12 @@ public sealed class ChatPipeline : IDisposable
         var system = BuildSystemContent();
         if (!string.IsNullOrWhiteSpace(extraSystem))
             system = string.IsNullOrWhiteSpace(system) ? extraSystem : system + "\n\n" + extraSystem;
+        SystemPromptDebug?.Invoke(system);
 
         var messages = new List<ChatMessage>();
         if (!string.IsNullOrWhiteSpace(system))
             messages.Add(new ChatMessage { Role = "system", Content = system });
-        messages.AddRange(Sanitize(_history));
+        messages.AddRange(Sanitize(History)); // 加锁快照，避免与 UI 线程遍历竞争
         return messages;
     }
 
@@ -261,12 +272,17 @@ public sealed class ChatPipeline : IDisposable
         IsRunning = true;
         try
         {
-            _history.Add(new ChatMessage { Role = "user", Content = userText });
+            lock (_histLock) _history.Add(new ChatMessage { Role = "user", Content = userText });
             NotifyHistory();
             Status?.Invoke("思考中…");
 
-            var rawReply = await CompleteAsync(await BuildMessagesAsync());
-            _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
+            var messages = await BuildMessagesAsync();
+            string rawReply;
+            if (_config.Chat.Agent.Enabled)
+                rawReply = await _agent.RunAsync(messages, host); // 工具循环，中间往返不进历史
+            else
+                rawReply = await CompleteAsync(messages);
+            lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             NotifyHistory();
 
             var (specs, fullText) = await PlanSegmentsAsync(rawReply);
@@ -314,8 +330,11 @@ public sealed class ChatPipeline : IDisposable
 
             // 把系统生成的沉默回合作为 user 消息一并记入历史，保证历史中 user/assistant 交替，
             // 避免连续堆积 assistant 发言导致模型下次误以为要说很长一段。
-            _history.Add(new ChatMessage { Role = "user", Content = silence });
-            _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
+            lock (_histLock)
+            {
+                _history.Add(new ChatMessage { Role = "user", Content = silence });
+                _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
+            }
             await MaybeCompressAsync();
             NotifyHistory();
             Status?.Invoke("");
@@ -556,20 +575,24 @@ public sealed class ChatPipeline : IDisposable
         var maxChars = _config.Chat.ContextMaxChars;
         if (max <= 0 && maxChars <= 0) return;
 
-        var count = _history.Count;
+        int count;
+        lock (_histLock) count = _history.Count;
         var overflowCount = max > 0 ? count - max : 0;
-        var overflowChars = maxChars > 0 ? _history.Sum(m => m.Content?.Length ?? 0) - maxChars : 0;
+        var overflowChars = maxChars > 0 ? History.Sum(m => m.Content?.Length ?? 0) - maxChars : 0;
         if (overflowCount < 2 && overflowChars <= 0) return;
 
         var take = max > 0 ? Math.Max(max / 2, 2) : 2;
         if (take >= count) take = count / 2;
         if (take < 2) return;
 
-        var chunk = _history.GetRange(0, take);
+        List<ChatMessage> chunk;
+        lock (_histLock) chunk = _history.GetRange(0, take);
         _summary = await CompressAsync(chunk, _summary);
-        _history.RemoveRange(0, take);
+        lock (_histLock) _history.RemoveRange(0, Math.Min(take, _history.Count));
+        int after;
+        lock (_histLock) after = _history.Count;
         var unit = maxChars > 0 ? "chars" : "n/a";
-        Log.Info($"History compressed: {count} msgs / {unit} -> {_history.Count} msgs");
+        Log.Info($"History compressed: {count} msgs / {unit} -> {after} msgs");
     }
 
     private async Task<string> CompressAsync(List<ChatMessage> chunk, string? prevSummary)
@@ -646,7 +669,7 @@ public sealed class ChatPipeline : IDisposable
 
     public void ClearHistory()
     {
-        _history.Clear();
+        lock (_histLock) _history.Clear();
         _summary = null;
         _lastProactive = null;
         NotifyHistory();
@@ -656,19 +679,22 @@ public sealed class ChatPipeline : IDisposable
 
     public void SetHistory(IEnumerable<ChatMessage> history)
     {
-        _history.Clear();
-        _history.AddRange(Sanitize(history));
+        lock (_histLock)
+        {
+            _history.Clear();
+            _history.AddRange(Sanitize(history));
+        }
         NotifyHistory();
     }
 
     public async Task<bool> CompressNowAsync()
     {
-        if (_history.Count == 0) return false;
+        lock (_histLock) { if (_history.Count == 0) return false; }
         await _gate.WaitAsync();
         try
         {
-            var result = await CompressAsync(_history.ToList(), _summary);
-            _history.Clear();
+            var result = await CompressAsync(History.ToList(), _summary);
+            lock (_histLock) _history.Clear();
             _lastProactive = null;
             _summary = string.IsNullOrWhiteSpace(result) ? null : result.Trim();
             NotifyHistory();

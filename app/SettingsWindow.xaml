@@ -210,6 +210,7 @@
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
                     <TextBlock Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="3" Text="LLM 服务（OpenAI 兼容接口，全局默认）"
@@ -314,18 +315,9 @@
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="24"/>
                             <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="24"/>
-                            <ColumnDefinition Width="80"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="24"/>
-                            <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
                         <CheckBox x:Name="ProactiveCheck" Grid.Column="0" Content="角色主动向用户搭话" Foreground="#222" VerticalAlignment="Center"/>
-                        <CheckBox x:Name="ScreenAwareCheck" Grid.Column="2" Content="屏幕感知（多模态，需 vision 模型）" Foreground="#222" VerticalAlignment="Center"/>
-                        <TextBlock Grid.Column="4" Text="观察概率" Foreground="#444" VerticalAlignment="Center"/>
-                        <TextBox x:Name="ScreenAwareChanceBox" Grid.Column="5" Width="80" HorizontalAlignment="Left" Margin="8,0,0,0"
-                                 Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
-                        <CheckBox x:Name="CrossFadeCheck" Grid.Column="7" Content="立绘切换过渡效果（淡入淡出）" Foreground="#222" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="CrossFadeCheck" Grid.Column="2" Content="立绘切换过渡效果（淡入淡出）" Foreground="#222" VerticalAlignment="Center"/>
                     </Grid>
 
                     <Grid Grid.Row="14" Grid.ColumnSpan="3" Margin="0,0,0,12">
@@ -371,6 +363,99 @@
                         </StackPanel>
                     </Grid>
                 </Grid>
+            </ScrollViewer>
+        </TabItem>
+
+        <TabItem Header="Agent 设置" Background="#FFFFFF">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Background="#FFFFFF">
+                <StackPanel Margin="12,12,12,12" MaxWidth="760" HorizontalAlignment="Left">
+                    <TextBlock Text="Agent（电脑操作助手）" Foreground="#2A5C8A" FontWeight="Bold" Margin="0,0,0,8"/>
+                    <CheckBox x:Name="AgentCheck"
+                              Content="启用 Agent：角色可调用工具读取/创建文件、搜索文件、运行 PowerShell（写/删操作按下方权限设定决定是否先向你确认）"
+                              Foreground="#222" Margin="0,0,0,10"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="60"/>
+                            <ColumnDefinition Width="24"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="24"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="70"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="最大工具步数" Foreground="#444" VerticalAlignment="Center"/>
+                        <TextBox x:Name="AgentMaxStepsBox" Grid.Column="2" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                        <TextBlock Grid.Column="4" Text="PowerShell 超时(秒)" Foreground="#444" VerticalAlignment="Center"/>
+                        <TextBox x:Name="AgentPsTimeoutBox" Grid.Column="6" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                        <TextBlock Grid.Column="8" Text="单次读文件行数上限" Foreground="#444" VerticalAlignment="Center"/>
+                        <TextBox x:Name="AgentReadLinesBox" Grid.Column="10" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                    </Grid>
+
+                    <TextBlock Text="工作目录（相对路径与 PowerShell 的基准，留空=程序所在目录）" Foreground="#444" Margin="0,12,0,4"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBox x:Name="AgentWorkDirBox" Grid.Column="0" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                        <Button x:Name="AgentWorkDirBrowseBtn" Grid.Column="2" Content="浏览…" Click="OnAgentWorkDirBrowse"
+                                Background="#5A6A8A" Foreground="White" BorderThickness="0" Padding="10,3" Cursor="Hand"/>
+                    </Grid>
+
+                    <Grid Margin="0,12,0,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="6"/>
+                            <ColumnDefinition Width="90"/>
+                            <ColumnDefinition Width="18"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="6"/>
+                            <ColumnDefinition Width="90"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="工作目录写权限" Foreground="#444" VerticalAlignment="Center"/>
+                        <ComboBox x:Name="AgentWorkDirPermCombo" Grid.Column="2">
+                            <ComboBoxItem Content="自动" Tag="auto"/>
+                            <ComboBoxItem Content="可写入" Tag="write"/>
+                            <ComboBoxItem Content="只读" Tag="readonly"/>
+                        </ComboBox>
+                        <TextBlock Grid.Column="4" Text="其他目录写权限" Foreground="#444" VerticalAlignment="Center"/>
+                        <ComboBox x:Name="AgentOtherDirPermCombo" Grid.Column="6">
+                            <ComboBoxItem Content="自动" Tag="auto"/>
+                            <ComboBoxItem Content="可写入" Tag="write"/>
+                            <ComboBoxItem Content="只读" Tag="readonly"/>
+                        </ComboBox>
+                    </Grid>
+
+                    <TextBlock Text="权限说明：自动=新建文件自动放行、覆盖/删除先确认；可写入=写操作全部自动放行；只读=一切写/删都先确认。PowerShell 命令按同一套规则分级：只读命令直接执行；非只读命令仅当全部字面路径都在允许范围内（信任目录/可写范围）才自动执行，含变量等无法判定的命令一律先确认。"
+                               Foreground="#888" FontSize="11" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+                    <TextBlock Text="信任目录（其下文件操作直接放行；字面路径全部位于其中的 PowerShell 命令也放行。可在确认弹窗中一键添加）" Foreground="#444" Margin="0,12,0,4"/>
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="8"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <ListBox x:Name="TrustedDirsList" Grid.Column="0" Height="76" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
+                        <StackPanel Grid.Column="2">
+                            <Button Content="添加…" Click="OnTrustedDirAdd" Background="#5A6A8A" Foreground="White" BorderThickness="0" Padding="10,3" Cursor="Hand"/>
+                            <Button Content="移除所选" Click="OnTrustedDirRemove" Background="#8A5A5A" Foreground="White" BorderThickness="0" Padding="10,3" Margin="0,6,0,0" Cursor="Hand"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <TextBlock Text="Agent 观察屏幕（observe_screen 截图范围；不勾选=当前鼠标所在屏幕，需 Agent LLM 支持视觉）" Foreground="#444" Margin="0,12,0,4"/>
+                    <WrapPanel x:Name="AgentScreensPanel" MinHeight="22"/>
+
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+                        <Button Content="保存 Agent 设置" Click="OnSaveAgent"
+                                Background="#3A7A4A" Foreground="White" BorderThickness="0" Padding="16,7"/>
+                    </StackPanel>
+                </StackPanel>
             </ScrollViewer>
         </TabItem>
     </TabControl>

@@ -34,6 +34,23 @@ public partial class App : System.Windows.Application
     protected override void OnStartup(StartupEventArgs e)
     {
         Log.Info("App starting");
+
+        // 全局异常兜底：记录完整堆栈到 pet.log，UI 线程异常拦截住不让进程静默死亡
+        DispatcherUnhandledException += (s, ev) =>
+        {
+            Log.Error("UI 线程未处理异常（已拦截，程序继续运行）", ev.Exception);
+            ev.Handled = true;
+        };
+        AppDomain.CurrentDomain.UnhandledException += (s, ev) =>
+        {
+            if (ev.ExceptionObject is Exception ex) Log.Error("AppDomain 未处理异常", ex);
+        };
+        TaskScheduler.UnobservedTaskException += (s, ev) =>
+        {
+            Log.Error("未观察的后台任务异常", ev.Exception);
+            ev.SetObserved();
+        };
+
         _mutex = new Mutex(true, MutexName, out bool createdNew);
         if (!createdNew)
         {
@@ -72,11 +89,13 @@ public partial class App : System.Windows.Application
             {
                 _chatPipeline = new ChatPipeline(Config);
                 _chatPipeline.DebugLog = text => _debugWindow?.Append(text);
+                _chatPipeline.SystemPromptDebug = text => _debugWindow?.SetSystemPrompt(text);
+                LlamaClient.OnRequest = (url, json) => _debugWindow?.SetRawRequest(url + "\n" + json);
                 _chatWindow = new ChatWindow(Config, _chatPipeline, () => _window?.GetWindowRect());
+                // 聊天窗可见时权限确认在聊天窗内完成，否则回退宠物气泡
+                _window.ConfirmRedirect = req => _chatWindow!.TryShowConfirmAsync(req);
                 _window.ChatRequested = () => Dispatcher.Invoke(() =>
                 {
-                    if (Config.Chat.ScreenAware)
-                        _ = _chatPipeline.ObserveScreenAsync();
                     _chatWindow?.ShowForInput();
                 });
                 SetupHotkey();
@@ -353,7 +372,7 @@ public partial class App : System.Windows.Application
                 _proactiveTimer.Tick += OnProactiveTick;
             }
             _proactiveTimer.Stop();
-            _proactiveEnabled = Config.Chat.Enabled && (Config.Chat.Proactive || Config.Chat.ScreenAware) && Config.Chat.ProactiveIntervalSec > 0;
+            _proactiveEnabled = Config.Chat.Enabled && Config.Chat.Proactive && Config.Chat.ProactiveIntervalSec > 0;
             if (_proactiveEnabled)
             {
                 _proactiveTimer.Interval = TimeSpan.FromSeconds(Config.Chat.ProactiveIntervalSec);
@@ -414,8 +433,6 @@ public partial class App : System.Windows.Application
     {
         try
         {
-            if (Config.Chat.ScreenAware && Random.Shared.NextDouble() < Config.Chat.ScreenAwareChance)
-                await _chatPipeline!.ObserveScreenAsync();
             if (Config.Chat.Proactive)
                 await _chatPipeline!.RunProactiveAsync(_window!);
         }

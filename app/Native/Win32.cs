@@ -53,6 +53,13 @@ public static class WindowUtil
         var insertAfter = topmost ? HWND_TOPMOST : IntPtr.Zero;
         return SetWindowPos(hwnd, insertAfter, x, y, 0, 0, flags);
     }
+
+    /// <summary>把窗口提到顶层组最前（不移动、不改大小、不激活）。</summary>
+    public static void BringToTop(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return;
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 }
 
 public static class CursorUtil

@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Windows;
@@ -322,11 +324,23 @@ ExtraParamsBox.Text = CurrentProviderExtra();
         IdleIntervalBox.Text = _config.Character.IdleIntervalSec.ToString("0.###");
         BubbleReserveBox.Text = _config.Character.BubbleReserve.ToString("0.###");
         ProactiveCheck.IsChecked = _config.Chat.Proactive;
-        ScreenAwareCheck.IsChecked = _config.Chat.ScreenAware;
-        ScreenAwareChanceBox.Text = _config.Chat.ScreenAwareChance.ToString("0.##");
+        BuildAgentScreenChecks();
         CrossFadeCheck.IsChecked = _config.Character.CrossFade;
         ReadInnerThoughtsCheck.IsChecked = _config.Chat.ReadInnerThoughts;
         GlobalUserAddressBox.Text = _config.Chat.UserAddress;
+        AgentCheck.IsChecked = _config.Chat.Agent.Enabled;
+        AgentMaxStepsBox.Text = _config.Chat.Agent.MaxSteps.ToString();
+        AgentPsTimeoutBox.Text = _config.Chat.Agent.PsTimeoutSec.ToString("0.#");
+        AgentReadLinesBox.Text = _config.Chat.Agent.ReadFileMaxLines.ToString();
+        // 工作目录留空时显示默认值（程序所在目录），保存后即变为显式配置
+        AgentWorkDirBox.Text = string.IsNullOrWhiteSpace(_config.Chat.Agent.WorkDir)
+            ? System.AppContext.BaseDirectory.TrimEnd('\\')
+            : _config.Chat.Agent.WorkDir;
+        AgentWorkDirPermCombo.SelectedIndex = TagIndex(AgentWorkDirPermCombo, _config.Chat.Agent.WorkDirPerm);
+        AgentOtherDirPermCombo.SelectedIndex = TagIndex(AgentOtherDirPermCombo, _config.Chat.Agent.OtherDirPerm);
+        // 直接绑定配置里的活集合（ObservableCollection）：增删即时刷新 UI，且与确认弹窗的"信任该目录"共享同一实例
+        var tdirs = _config.Chat.Agent.TrustedDirs ??= new ObservableCollection<string>();
+        TrustedDirsList.ItemsSource = tdirs;
         BubbleDurationSlider.Value = Math.Clamp(_config.Character.BubbleDurationSec, BubbleDurationSlider.Minimum, BubbleDurationSlider.Maximum);
         BubbleDurationValueText.Text = BubbleDurationSlider.Value.ToString("0.#");
     }
@@ -426,9 +440,6 @@ ExtraParamsBox.Text = CurrentProviderExtra();
                 _config.Character.BubbleReserve = br;
 
             _config.Chat.Proactive = ProactiveCheck.IsChecked == true;
-            _config.Chat.ScreenAware = ScreenAwareCheck.IsChecked == true;
-            if (double.TryParse(ScreenAwareChanceBox.Text?.Trim(), out var sac) && sac >= 0 && sac <= 1)
-                _config.Chat.ScreenAwareChance = sac;
             _config.Character.CrossFade = CrossFadeCheck.IsChecked == true;
             _config.Chat.ReadInnerThoughts = ReadInnerThoughtsCheck.IsChecked == true;
             _config.Character.BubbleDurationSec = BubbleDurationSlider.Value;
@@ -450,6 +461,93 @@ ExtraParamsBox.Text = CurrentProviderExtra();
     {
         if (BubbleDurationValueText != null)
             BubbleDurationValueText.Text = BubbleDurationSlider.Value.ToString("0.#");
+    }
+
+    private void OnSaveAgent(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            _config.Chat.Agent.Enabled = AgentCheck.IsChecked == true;
+            if (int.TryParse(AgentMaxStepsBox.Text?.Trim(), out var ms) && ms > 0)
+                _config.Chat.Agent.MaxSteps = ms;
+            if (double.TryParse(AgentPsTimeoutBox.Text?.Trim(), out var pts) && pts >= 5 && pts <= 300)
+                _config.Chat.Agent.PsTimeoutSec = pts;
+            if (int.TryParse(AgentReadLinesBox.Text?.Trim(), out var rml) && rml > 0)
+                _config.Chat.Agent.ReadFileMaxLines = rml;
+            _config.Chat.Agent.WorkDir = AgentWorkDirBox.Text?.Trim() ?? "";
+            if (AgentWorkDirPermCombo.SelectedItem is ComboBoxItem wi)
+                _config.Chat.Agent.WorkDirPerm = (wi.Tag as string) ?? "auto";
+            if (AgentOtherDirPermCombo.SelectedItem is ComboBoxItem oi)
+                _config.Chat.Agent.OtherDirPerm = (oi.Tag as string) ?? "auto";
+            // TrustedDirs 与 UI 是同一个集合，无需回写
+            _config.Chat.Agent.AgentScreens = AgentScreensPanel.Children.OfType<System.Windows.Controls.CheckBox>()
+                .Where(c => c.IsChecked == true)
+                .Select(c => (int)c.Tag!)
+                .ToList();
+
+            _config.Save();
+            App.RefreshAll();
+            Log.Info("Agent settings saved");
+            ShowStatus("Agent 设置已保存并生效");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Save agent settings failed", ex);
+            ShowStatus("保存失败：" + ex.Message, ok: false);
+        }
+    }
+
+    /// <summary>按当前检测到的显示器动态生成「Agent 观察屏幕」复选框（1-based，主屏标记）。</summary>
+    private void BuildAgentScreenChecks()
+    {
+        AgentScreensPanel.Children.Clear();
+        var selected = _config.Chat.Agent.AgentScreens ?? new List<int>();
+        System.Windows.Forms.Screen[] screens;
+        try { screens = System.Windows.Forms.Screen.AllScreens; }
+        catch { return; }
+        for (var i = 0; i < screens.Length; i++)
+        {
+            var idx = i + 1;
+            var screen = screens[i];
+            var dev = screen.DeviceName.Split('\\').Last();
+            AgentScreensPanel.Children.Add(new System.Windows.Controls.CheckBox
+            {
+                Content = MakeScreenLabel(idx, screen, dev),
+                IsChecked = selected.Contains(idx),
+                Tag = idx,
+                Margin = new Thickness(0, 0, 12, 4),
+                Foreground = System.Windows.Media.Brushes.Black,
+            });
+        }
+    }
+
+    private static string MakeScreenLabel(int idx, System.Windows.Forms.Screen s, string name)
+        => idx + (s.Primary ? "（主屏）" : "") + " " + name + " " + s.Bounds.Width + "×" + s.Bounds.Height;
+
+    /// <summary>用 Win 自带目录选择框选工作目录。</summary>
+    private void OnAgentWorkDirBrowse(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFolderDialog { Title = "选择工作目录" };
+        var cur = AgentWorkDirBox.Text?.Trim() ?? "";
+        if (!string.IsNullOrEmpty(cur) && Directory.Exists(cur)) dlg.InitialDirectory = cur;
+        if (dlg.ShowDialog(this) == true)
+            AgentWorkDirBox.Text = dlg.FolderName;
+    }
+
+    private void OnTrustedDirAdd(object sender, RoutedEventArgs e)
+    {
+        var dlg = new Microsoft.Win32.OpenFolderDialog { Title = "选择信任目录" };
+        if (dlg.ShowDialog(this) != true) return;
+        var list = TrustedDirsList.ItemsSource as ObservableCollection<string>;
+        if (list == null) return;
+        if (!list.Any(d => string.Equals(d.Trim(), dlg.FolderName.Trim(), StringComparison.OrdinalIgnoreCase)))
+            list.Add(dlg.FolderName);
+    }
+
+    private void OnTrustedDirRemove(object sender, RoutedEventArgs e)
+    {
+        if (TrustedDirsList.SelectedItem is string s)
+            (TrustedDirsList.ItemsSource as ObservableCollection<string>)?.Remove(s);
     }
 
     private void OnClose(object sender, RoutedEventArgs e) => Close();

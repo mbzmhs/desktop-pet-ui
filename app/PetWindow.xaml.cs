@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -48,6 +49,13 @@ public partial class PetWindow : Window, ISpeakHost
     private System.Windows.Input.Cursor? _currentCursor;
     private DispatcherTimer? _bubbleTimer;
     private DispatcherTimer? _idleResetTimer;
+    private TaskCompletionSource<ConfirmResult>? _confirmTcs;
+    private TaskCompletionSource<AskResult>? _askTcs;
+    private bool? _confirmPrevOverride;
+    private string? _confirmTrustDir; // 本次确认可一键信任的目录（null=不显示该按钮）
+    private DispatcherTimer? _confirmTimer; // 确认/提问气泡共用超时定时器
+    private double _dialogGrowDelta;    // 本次对话框为容纳内容临时向上扩大的窗口高度（关闭时还原）
+    private double _dialogExtraReserve; // 与 _dialogGrowDelta 配套的额外气泡预留（扩大时立绘尺寸不变）
     private System.Media.SoundPlayer? _currentPlayer;
     private System.IO.Stream? _currentStream;
     private CancellationTokenSource? _streamCts;
@@ -385,7 +393,7 @@ public partial class PetWindow : Window, ISpeakHost
         var winH = ActualHeight;
         if (winW <= 0 || winH <= 0) return;
         _dpiScale = VisualTreeHelper.GetDpi(this).DpiScaleX;
-        var reserved = Math.Max(0, _config.Character.BubbleReserve);
+        var reserved = Math.Max(0, _config.Character.BubbleReserve) + _dialogExtraReserve;
         var availH = Math.Max(1, winH - reserved);
         var fit = Math.Min(winW / _imgPxW, availH / _imgPxH);
         if (fit <= 0 || !double.IsFinite(fit)) fit = 1;
@@ -445,6 +453,12 @@ public partial class PetWindow : Window, ISpeakHost
     public void ShowBubble(string? text)
     {
         if (string.IsNullOrWhiteSpace(text)) return;
+        // 普通语音气泡：窄版纯文本，清掉可能残留的确认对话框结构化行
+        BubbleTitleRow.Visibility = Visibility.Collapsed;
+        BubbleRiskNote.Visibility = Visibility.Collapsed;
+        BubbleDetailBox.Visibility = Visibility.Collapsed;
+        BubbleText.Visibility = Visibility.Visible;
+        Bubble.MaxWidth = Math.Max(240, Math.Min(280, ActualWidth - 12));
         BubbleText.Text = text.Length > 200 ? text[..200] + "…" : text;
         LayoutBubble();
         Bubble.Visibility = Visibility.Visible;
@@ -480,6 +494,7 @@ public partial class PetWindow : Window, ISpeakHost
     /// <summary>语音（流式）播完、气泡定时到点或切换角色时收起气泡、恢复空闲表情，并触发 SpeechFinished 以重启主动搭话计时。</summary>
     private void EndSpeechVisuals()
     {
+        if (_confirmTcs != null || _askTcs != null) return; // 确认/提问气泡等待用户操作期间不受语音定时器影响
         _bubbleTimer?.Stop();
         Bubble.Visibility = Visibility.Collapsed;
         StopIdleReset();
@@ -574,19 +589,7 @@ public partial class PetWindow : Window, ISpeakHost
         var bw = Bubble.ActualWidth;
         var bh = Bubble.ActualHeight;
         var winW = ActualWidth;
-
-        // 头顶位置：不透明像素外接框顶部；无遮罩时退回立绘显示区顶部
-        double headTopY, headCenterX;
-        if (_bodyMinY < int.MaxValue && _dispScale > 0)
-        {
-            headTopY = _dispTop + _bodyMinY * _dispScale;
-            headCenterX = _dispLeft + (_bodyMinX + _bodyMaxX) / 2.0 * _dispScale;
-        }
-        else
-        {
-            headTopY = _dispTop;
-            headCenterX = winW / 2.0;
-        }
+        var (headTopY, headCenterX) = HeadAnchor();
 
         const double headGap = 4;        // 尾巴尖到头顶的间距
         const double tailExtent = 12;    // 尾巴在气泡底部之下伸出的长度（与 XAML 中的 Margin 对应）
@@ -596,6 +599,14 @@ public partial class PetWindow : Window, ISpeakHost
         Canvas.SetLeft(Bubble, left);
         Canvas.SetTop(Bubble, top);
         Canvas.SetZIndex(Bubble, 5);
+    }
+
+    /// <summary>头顶锚点（窗口坐标）：不透明像素外接框顶部与中心；无遮罩时退回立绘显示区顶部。</summary>
+    private (double Top, double CenterX) HeadAnchor()
+    {
+        if (_bodyMinY < int.MaxValue && _dispScale > 0)
+            return (_dispTop + _bodyMinY * _dispScale, _dispLeft + (_bodyMinX + _bodyMaxX) / 2.0 * _dispScale);
+        return (_dispTop, ActualWidth / 2.0);
     }
 
     public List<string> GetCharacters() => _config.ListCharacters();
@@ -786,6 +797,297 @@ public partial class PetWindow : Window, ISpeakHost
                 NotifySpeechFinished(seq, true);
             }
         });
+    }
+
+    // ---------------- agent 确认气泡 ----------------
+
+    private const int ConfirmTimeoutSec = 120;
+
+    /// <summary>确认重定向：聊天窗可见时由它接管确认；返回 null 表示回退到本窗气泡。</summary>
+    public Func<ConfirmRequest, Task<ConfirmResult>?>? ConfirmRedirect { get; set; }
+
+    /// <summary>弹出带 [确认][取消]（必要时另有[信任该目录]）按钮的气泡，等待用户点击；超时按取消处理。</summary>
+    public async Task<ConfirmResult> ConfirmAsync(ConfirmRequest request)
+    {
+        if (_confirmTcs != null || _askTcs != null)
+            return new ConfirmResult { Allowed = false }; // 已有气泡在等用户，直接按拒绝返回
+
+        // 聊天窗开着时在聊天窗内确认（不弹宠物气泡）
+        var redirect = ConfirmRedirect;
+        if (redirect != null)
+        {
+            try
+            {
+                var task = redirect(request);
+                if (task != null) return await task;
+            }
+            catch { /* 重定向失败则回退气泡 */ }
+        }
+
+        var tcs = new TaskCompletionSource<ConfirmResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _confirmTcs = tcs;
+        _confirmTrustDir = request?.TrustableDir;
+        try
+        {
+            EnsureDialogTimer();
+            _ = System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                ShowConfirmChrome(request);
+                ConfirmYesBtn.Visibility = Visibility.Visible;
+                ConfirmTrustBtn.Visibility = _confirmTrustDir != null ? Visibility.Visible : Visibility.Collapsed;
+                TextInputRow.Visibility = Visibility.Collapsed;
+                ApplyEmotion("shy"); // 请求许可的小心表情（缺失时回退 idle）
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error("ConfirmAsync dispatch failed", ex);
+            tcs.TrySetResult(new ConfirmResult { Allowed = false });
+        }
+        return await tcs.Task;
+    }
+
+    /// <summary>弹出带输入框 + [发送][取消] 的气泡向用户提问，等待用户键入回答；超时/关闭按未回答处理。</summary>
+    public Task<AskResult> AskUserAsync(string question)
+    {
+        var tcs = new TaskCompletionSource<AskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (_confirmTcs != null || _askTcs != null)
+        {
+            tcs.TrySetResult(new AskResult { Answered = false }); // 已有气泡在等用户，直接返回未回答
+            return tcs.Task;
+        }
+        _askTcs = tcs;
+        try
+        {
+            EnsureDialogTimer();
+            System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
+            {
+                ShowDialogChrome(question ?? "");
+                ConfirmYesBtn.Visibility = Visibility.Collapsed;
+                ConfirmTrustBtn.Visibility = Visibility.Collapsed;
+                AskInputBox.Clear();
+                TextInputRow.Visibility = Visibility.Visible;
+                ApplyEmotion("curious"); // 提问表情（缺失时回退 idle）
+                System.Windows.Input.Keyboard.Focus(AskInputBox);
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Error("AskUserAsync dispatch failed", ex);
+            tcs.TrySetResult(new AskResult { Answered = false });
+        }
+        return tcs.Task;
+    }
+
+    private void EnsureDialogTimer()
+    {
+        if (_confirmTimer == null)
+        {
+            _confirmTimer = new DispatcherTimer();
+            _confirmTimer.Tick += (_, _) => FinishActiveDialog(answered: false, timedOut: true);
+        }
+    }
+
+    /// <summary>两种气泡共用的显示前置：置顶、关穿透、按窗口宽度收气泡宽。</summary>
+    private void BeginDialogChrome()
+    {
+        StopSpeechTimers(); // 防止旧的语音定时器把气泡收掉
+        if (_hwnd != IntPtr.Zero) WindowUtil.BringToTop(_hwnd); // 提到顶层组最前，盖住聊天输入窗等
+        _confirmPrevOverride = _clickThroughOverride;
+        _clickThroughOverride = false;
+        SetPassThrough(false); // 气泡在角色图 alpha 掩码之外，不强制的话鼠标采样会判成穿透、按钮点不到
+        Bubble.MaxWidth = Math.Max(240, Math.Min(460, ActualWidth - 12));
+    }
+
+    /// <summary>显示收尾：显示按钮行、必要时向上扩窗、定位气泡、启动超时。</summary>
+    private void EndDialogChrome()
+    {
+        ConfirmNoBtn.Visibility = Visibility.Visible;
+        BubbleButtons.Visibility = Visibility.Visible;
+        GrowWindowForBubble(); // 内容高于头顶空间时临时把窗口向上扩大（对话框关闭时还原）
+        LayoutBubble();
+        Bubble.Visibility = Visibility.Visible;
+        _confirmTimer!.Interval = TimeSpan.FromSeconds(ConfirmTimeoutSec);
+        _confirmTimer.Stop();
+        _confirmTimer.Start();
+    }
+
+    /// <summary>纯文本气泡（提问/回退）：无标题、无徽标、无详情块。</summary>
+    private void ShowDialogChrome(string question)
+    {
+        BeginDialogChrome();
+        BubbleTitleRow.Visibility = Visibility.Collapsed;
+        BubbleRiskNote.Visibility = Visibility.Collapsed;
+        BubbleDetailBox.Visibility = Visibility.Collapsed;
+        BubbleText.Visibility = Visibility.Visible;
+        BubbleText.Text = CapText(question, 1000);
+        EndDialogChrome();
+    }
+
+    /// <summary>结构化确认气泡：标题 + 风险徽标（+风险说明）+ 等宽详情块，关键信息不省略。</summary>
+    private void ShowConfirmChrome(ConfirmRequest? req)
+    {
+        BeginDialogChrome();
+        if (string.IsNullOrWhiteSpace(req?.Title))
+        {
+            // 无结构化字段时回退纯文本
+            BubbleTitleRow.Visibility = Visibility.Collapsed;
+            BubbleRiskNote.Visibility = Visibility.Collapsed;
+            BubbleDetailBox.Visibility = Visibility.Collapsed;
+            BubbleText.Visibility = Visibility.Visible;
+            BubbleText.Text = CapText(req?.Question ?? "", 1000);
+        }
+        else
+        {
+            BubbleTitleRow.Visibility = Visibility.Visible;
+            BubbleTitle.Text = req.Title!;
+            ApplyRiskBadge(req.Risk, req.RiskNote);
+            if (string.IsNullOrWhiteSpace(req.Detail))
+                BubbleDetailBox.Visibility = Visibility.Collapsed;
+            else
+            {
+                BubbleDetailBox.Visibility = Visibility.Visible;
+                BubbleDetail.Text = CapText(req.Detail, 2000);
+            }
+            BubbleText.Visibility = Visibility.Collapsed;
+        }
+        EndDialogChrome();
+    }
+
+    /// <summary>风险徽标：low=绿 / medium=黄 / high=红；风险说明显示在标题下小字行。</summary>
+    private void ApplyRiskBadge(string risk, string note)
+    {
+        if (!string.IsNullOrWhiteSpace(note))
+        {
+            BubbleRiskNote.Text = "风险说明：" + CapText(note, 200);
+            BubbleRiskNote.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            BubbleRiskNote.Visibility = Visibility.Collapsed;
+        }
+
+        (System.Windows.Media.Brush? color, string label) badge = risk switch
+        {
+            "low" => (MakeBrush("#3A7A4A"), "低风险"),
+            "medium" => (MakeBrush("#B07D2E"), "中风险"),
+            "high" => (MakeBrush("#B03A3A"), "高风险"),
+            _ => (null, ""),
+        };
+        if (badge.color == null) RiskBadge.Visibility = Visibility.Collapsed;
+        else
+        {
+            RiskBadge.Background = badge.color;
+            RiskBadgeText.Text = badge.label;
+            RiskBadge.Visibility = Visibility.Visible;
+        }
+    }
+
+    private static System.Windows.Media.Brush MakeBrush(string hex) =>
+        new System.Windows.Media.SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(hex));
+
+    /// <summary>
+    /// 气泡内容高于角色头顶空间时，把窗口临时向上扩大 δ：Top-δ / Height+δ / 预留+δ
+    /// （预留同步增加 → 立绘可用高度不变 → 尺寸与屏幕位置保持不动）。对话框关闭时 RestoreDialogWindow 还原。
+    /// </summary>
+    private void GrowWindowForBubble()
+    {
+        Bubble.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+        var bh = Bubble.DesiredSize.Height;
+        var headTopY = HeadAnchor().Top;
+        const double headGap = 4;        // 尾巴尖到头顶的间距
+        const double tailExtent = 12;    // 尾巴在气泡底部之下伸出的长度（与 XAML 中的 Margin 对应）
+        const double margin = 4;         // 距窗口顶边最小距离
+        var required = bh + headGap + tailExtent + margin;
+        var available = headTopY - margin;
+        if (required <= available) return;
+
+        var delta = required - available;
+        // 不把窗口推出虚拟屏幕顶边；空间不够时允许气泡盖住角色头顶（与旧行为一致）
+        if (GetVirtualScreen() is { } vs) delta = Math.Min(delta, Top - vs.Top);
+        if (delta <= 0) return;
+
+        Top -= delta;
+        Height += delta; // SizeChanged → LayoutImage
+        _dialogExtraReserve += delta;
+        _dialogGrowDelta += delta;
+    }
+
+    /// <summary>对话框结束时还原窗口尺寸。用"加回 δ"而非恢复绝对值，与对话框期间的用户拖动可正确叠加。</summary>
+    private void RestoreDialogWindow()
+    {
+        if (_dialogGrowDelta <= 0) return;
+        var d = _dialogGrowDelta;
+        _dialogGrowDelta = 0;
+        Height -= d;
+        Top += d;
+        _dialogExtraReserve -= d;
+    }
+
+    private static string CapText(string s, int max) =>
+        string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "\n…（已截断）");
+
+    private void OnConfirmYes(object sender, RoutedEventArgs e) => FinishActiveDialog(answered: true);
+
+    private void OnConfirmNo(object sender, RoutedEventArgs e) => FinishActiveDialog(answered: false);
+
+    /// <summary>放行本次操作，并把目标所在目录加入信任列表（对字面路径可验证的 PowerShell 命令同样生效）。</summary>
+    private void OnConfirmTrust(object sender, RoutedEventArgs e)
+    {
+        var dir = _confirmTrustDir;
+        if (dir == null) return;
+        var list = _config.Chat.Agent.TrustedDirs ??= new ObservableCollection<string>();
+        if (!list.Any(d => string.Equals((d ?? "").Trim(), dir.Trim(), StringComparison.OrdinalIgnoreCase)))
+            list.Add(dir);
+        _config.Save();
+        Log.Info("Agent trust dir added: " + dir);
+        FinishActiveDialog(answered: true, trustFolder: true);
+    }
+
+    private void OnAskSend(object sender, RoutedEventArgs e) => SendAskAnswer();
+
+    private void OnAskInputKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter)
+        {
+            e.Handled = true;
+            SendAskAnswer();
+        }
+    }
+
+    private void SendAskAnswer() => FinishActiveDialog(answered: true, text: AskInputBox.Text?.Trim() ?? "");
+
+    /// <summary>当前活动气泡结束（点击/超时），幂等：只有第一个结果生效。确认与提问两种模式共用。</summary>
+    private void FinishActiveDialog(bool answered, bool timedOut = false, string? text = null, bool trustFolder = false)
+    {
+        if (_confirmTcs != null)
+        {
+            var ok = answered && !timedOut;
+            _confirmTcs.TrySetResult(new ConfirmResult { Allowed = ok, TrustFolder = trustFolder && !timedOut });
+            Log.Info("Agent confirm: " + (ok ? (trustFolder ? "confirmed + folder trusted" : "confirmed") : timedOut ? "timeout, treated as decline" : "declined"));
+        }
+        else if (_askTcs != null)
+        {
+            _askTcs.TrySetResult(new AskResult { Answered = answered && !timedOut, Text = (answered && !timedOut) ? text ?? "" : "" });
+            Log.Info("Agent ask: " + (!timedOut ? ("answered: " + TruncateLog(text)) : "timeout, treated as no answer"));
+        }
+        else return;
+
+        _confirmTcs = null;
+        _askTcs = null;
+        _confirmTrustDir = null;
+        _confirmTimer?.Stop();
+        _clickThroughOverride = _confirmPrevOverride; // 恢复正常鼠标穿透采样
+        RestoreDialogWindow(); // 还原为对话框期间的临时扩窗
+        BubbleButtons.Visibility = Visibility.Collapsed;
+        TextInputRow.Visibility = Visibility.Collapsed;
+        ShowIdle(); // 恢复空闲；最终回答的气泡随后由说话管线重新显示
+    }
+
+    private static string TruncateLog(string? s)
+    {
+        var t = (s ?? "").Replace("\n", " ⏎ ");
+        return t.Length > 200 ? t[..200] + "…" : t;
     }
 
     /// <summary>分段流式播放：仅第一段请求带 stop_prev 并等它被服务端注册后，再并行发出其余段请求，避免误杀自己。</summary>

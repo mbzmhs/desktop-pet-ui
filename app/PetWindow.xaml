@@ -24,19 +24,85 @@
             <Grid x:Name="Bubble"
                   Canvas.ZIndex="5"
                   Visibility="Collapsed"
-                  MaxWidth="280">
+                  MaxWidth="460">
                 <Border x:Name="BubbleBody"
                         Background="#FFFFFF"
                         BorderBrush="#333"
                         BorderThickness="1.5"
                         CornerRadius="10"
-                        Padding="10,8">
-                    <TextBlock x:Name="BubbleText"
-                               Foreground="#222"
-                               FontSize="14"
-                               LineHeight="20"
-                               TextWrapping="Wrap"
-                               MaxWidth="260"/>
+                        Padding="12,10">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <!-- 行0：动作标题 + 风险徽标 -->
+                        <Grid x:Name="BubbleTitleRow" Grid.Row="0" Visibility="Collapsed">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="BubbleTitle"
+                                       FontWeight="SemiBold" FontSize="14" Foreground="#222"
+                                       LineHeight="19" TextWrapping="Wrap"/>
+                            <Border x:Name="RiskBadge" Grid.Column="1" CornerRadius="9"
+                                    Padding="8,1.5" Margin="6,0,0,0" VerticalAlignment="Top"
+                                    Visibility="Collapsed">
+                                <TextBlock x:Name="RiskBadgeText" FontSize="12" Foreground="White"/>
+                            </Border>
+                        </Grid>
+                        <!-- 行1：风险说明 -->
+                        <TextBlock x:Name="BubbleRiskNote" Grid.Row="1"
+                                   FontSize="12" Foreground="#777" LineHeight="16"
+                                   TextWrapping="Wrap" Margin="0,4,0,0" Visibility="Collapsed"/>
+                        <!-- 行2：操作详情（等宽字体块） -->
+                        <Border x:Name="BubbleDetailBox" Grid.Row="2"
+                                Background="#F4F5F7" CornerRadius="6" Padding="8,6"
+                                Margin="0,8,0,0" Visibility="Collapsed">
+                            <TextBlock x:Name="BubbleDetail"
+                                       FontFamily="Consolas" FontSize="12.5" Foreground="#333"
+                                       LineHeight="17" TextWrapping="Wrap"/>
+                        </Border>
+                        <!-- 行3：纯文本（提问/回退） -->
+                        <TextBlock x:Name="BubbleText" Grid.Row="3"
+                                   Foreground="#222"
+                                   FontSize="14"
+                                   LineHeight="20"
+                                   TextWrapping="Wrap"
+                                   MaxWidth="436"/>
+                        <!-- 行4：按钮 -->
+                        <StackPanel x:Name="BubbleButtons" Grid.Row="4"
+                                    Orientation="Horizontal"
+                                    HorizontalAlignment="Center"
+                                    Visibility="Collapsed"
+                                    Margin="0,10,0,0">
+                            <Button x:Name="ConfirmYesBtn" Content="确认" Click="OnConfirmYes"
+                                    Background="#3A7A4A" Foreground="White" BorderThickness="0"
+                                    Padding="14,4" Cursor="Hand"/>
+                            <Button x:Name="ConfirmNoBtn" Content="取消" Click="OnConfirmNo"
+                                    Background="#8A5A5A" Foreground="White" BorderThickness="0"
+                                    Padding="14,4" Margin="8,0,0,0" Cursor="Hand"/>
+                            <Button x:Name="ConfirmTrustBtn" Content="信任该目录" Click="OnConfirmTrust"
+                                    Background="#5A6A8A" Foreground="White" BorderThickness="0"
+                                    Padding="14,4" Margin="8,0,0,0" Cursor="Hand"/>
+                        </StackPanel>
+                        <!-- 行5：提问输入 -->
+                        <StackPanel x:Name="TextInputRow" Grid.Row="5"
+                                    Orientation="Horizontal"
+                                    HorizontalAlignment="Center"
+                                    Visibility="Collapsed"
+                                    Margin="0,10,0,0">
+                            <TextBox x:Name="AskInputBox" Width="200" Padding="4,3" FontSize="13"
+                                     KeyDown="OnAskInputKeyDown"/>
+                            <Button x:Name="AskSendBtn" Content="发送" Click="OnAskSend"
+                                    Background="#3A7A4A" Foreground="White" BorderThickness="0"
+                                    Padding="10,3" Margin="6,0,0,0" Cursor="Hand"/>
+                        </StackPanel>
+                    </Grid>
                 </Border>
                 <Path x:Name="BubbleTailFill"
                       Fill="#FFFFFF"

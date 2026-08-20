@@ -100,7 +100,17 @@ out\desktop-pet-ui.exe
     "proactiveIntervalSec": 30.0,  // 主动搭话间隔（秒）
     "screenAware": false,          // 观察屏幕开关：截取鼠标所在屏幕发给 llama 多模态识别
     "screenAwareChance": 0.3,      // 每次空闲定时器触发时去观察屏幕的概率(0~1)
-    "userAddress": ""              // 默认称呼（角色未设置时生效，如「主人」「亲爱的」）
+    "userAddress": "",             // 默认称呼（角色未设置时生效，如「主人」「亲爱的」）
+
+    "agent": {                     // Agent：让角色调用工具执行电脑操作
+      "enabled": false,            // 总开关（false=纯聊天，不注入工具说明）
+      "maxSteps": 8,               // 单次对话最大工具调用次数
+      "psTimeoutSec": 60.0,        // 同步 run_powershell 超时（秒）
+      "jobMaxMinutes": 30.0,       // 后台任务硬上限（分钟），到点强杀
+      "maxRunningJobs": 4,         // 同时运行的后台任务数上限
+      "workDir": "",               // 相对路径 / PowerShell 工作目录（空=用户主目录）
+      "readFileMaxLines": 400      // read_file 最多返回行数
+    }
   }
 }
 ```
@@ -127,6 +137,31 @@ out\desktop-pet-ui.exe
   未打开时）主动搭话一次，走完整 TTS + 语音 + 气泡链路，并计入历史。
 - **观察桌面（多模态）**：`chat.screenAware=true` 时（需 LLM 加载 **vision 模型**）按概率截取
   鼠标所在屏幕，经图片消息发给 LLM 识别成文字，随之后对话作为上下文携带。
+- **Agent（电脑操作）**：`chat.agent.enabled=true` 时系统提示词注入【工具】说明，角色可在回复中
+  输出 `[tool]{"name":"...","args":{...}}[/tool]` 调用工具，宿主执行后把结果回填给模型继续推理，
+  循环直到最终回答（≤ `maxSteps` 步）。中间的工具往返只存在于本次运行，不进对话历史、不被朗读。
+
+## Agent 工具与分级确认
+
+| 工具 | 说明 | 默认级别 |
+|---|---|---|
+| `read_file(path)` | 读取文件（限 `readFileMaxLines` 行，二进制拒读） | 自动 |
+| `list_dir(path?)` | 列出目录内容 | 自动 |
+| `search_files(name_pattern, root_dir?, max_results?)` | 文件名通配符搜索（深度/访问数有上限） | 自动 |
+| `create_file(path, content)` | 创建新文件；**目标已存在时强制确认**（宿主端硬校验覆盖） | 视情况 |
+| `delete_file(path)` | 删除文件/目录（拒绝删盘符根目录） | **始终确认** |
+| `run_powershell(command, read_only)` | 同步运行 PowerShell（`psTimeoutSec` 超时强杀） | 见下 |
+| `start_powershell(command, read_only)` | 后台启动长任务，返回 `job_1` 等 id（跨对话存活） | 同 run_powershell |
+| `check_job(job_id)` | 查询后台任务进度/增量输出 | 自动 |
+
+- **分级确认**：删除、覆盖已有文件、非只读 PowerShell 命令 → 宠物头顶气泡弹出 [确认][取消] 按钮，
+  120s 无操作按拒绝处理；被拒后模型会自然告知用户「已取消」。
+- **PowerShell 只读判定（白名单制）**：模型声明 `read_only=true` 且命令通过宿主端双重校验
+  （写操作 cmdlet 特征 + 只读动词白名单）才自动执行，任何疑点一律弹确认。同步任务约 60s 内完成；
+  预计更久的任务用 `start_powershell`，之后可随时 `check_job(job_id)` 查询，活跃任务状态会注入
+  系统提示词防止模型忘记。
+- **路径安全**：相对路径一律锚定 `agent.workDir`（默认用户主目录）；所有工具调用与结果写入
+  `pet.log` 和调试窗口。
 - **时间上下文**：每次请求的系统提示始终附带当前日期/时间，角色能感知时间。
 - **持久化记忆**：切换角色与退出时把「摘要 + 历史」保存到 `character/<角色名>/memory.json`。
 - **情感联动**：情绪来源是**角色文件夹的子文件夹**（`character/<角色>/<情绪>/`）。管线解析

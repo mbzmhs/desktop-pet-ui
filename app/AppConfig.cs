@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
@@ -36,11 +37,35 @@ public sealed class ChatHotkeyConfig
 
 public sealed class ChatUiConfig
 {
-    public bool PopupFollowsPet { get; set; } = true;
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool PopupFollowsPet { get; set; } = true; // 已废弃：聊天窗改为独立窗口+记忆位置，不再跟随宠物
     public bool AlwaysOnTop { get; set; } = true;
     public double Width { get; set; } = 420;
-    public double Height { get; set; } = 340;
+    public double Height { get; set; } = 560;
     public int MaxBubbleChars { get; set; } = 120;
+    /// <summary>记忆窗口位置（NaN=未设置，首次打开时放到宠物附近并记住）。</summary>
+    public double X { get; set; } = double.NaN;
+    public double Y { get; set; } = double.NaN;
+}
+
+public sealed class ChatAgentConfig
+{
+    public bool Enabled { get; set; } = false; // Agent 总开关（false=纯聊天，不注入工具说明）
+    public int MaxSteps { get; set; } = 8;     // 单次对话最大工具调用次数
+    public double PsTimeoutSec { get; set; } = 60.0;   // 同步 run_powershell 超时（秒）
+    public double JobMaxMinutes { get; set; } = 30.0;  // 后台任务硬上限（分钟），到点强杀
+    public int MaxRunningJobs { get; set; } = 4;       // 同时运行的后台任务数上限
+    public string WorkDir { get; set; } = "";          // PowerShell/相对路径工作目录（空=程序所在目录）
+    public int ReadFileMaxLines { get; set; } = 400;   // read_file 最多返回行数
+
+    /// <summary>工作目录的文件写/删权限：auto=智能（新建自动、覆盖删除确认）write=全部自动 readonly=全部确认。默认 readonly。</summary>
+    public string WorkDirPerm { get; set; } = "readonly";
+    /// <summary>其他目录的文件写/删权限，取值同上。默认 auto。</summary>
+    public string OtherDirPerm { get; set; } = "auto";
+    /// <summary>信任目录列表（全局共享的活集合，设置页与确认弹窗直接增删同一实例）：其下的文件操作直接放行；字面路径全部位于其中的 PowerShell 命令同样放行。</summary>
+    public ObservableCollection<string> TrustedDirs { get; set; } = new();
+    /// <summary>observe_screen 工具捕获的屏幕（1-based 编号）；空列表=当前鼠标所在屏幕。</summary>
+    public List<int> AgentScreens { get; set; } = new();
 }
 
 public sealed class ProxyConfig
@@ -61,8 +86,6 @@ public sealed class ChatConfig
     public int ContextMaxChars { get; set; } = 4000;
     public bool Proactive { get; set; } = false;
     public double ProactiveIntervalSec { get; set; } = 30.0;
-    public bool ScreenAware { get; set; } = false;
-    public double ScreenAwareChance { get; set; } = 0.3;
     public string UserAddress { get; set; } = "";
     public string Provider { get; set; } = "openai"; // 请求格式："openai"（OpenAI 兼容，默认）；未来可加 "anthropic" 等
     public string ApiKey { get; set; } = "";
@@ -74,6 +97,7 @@ public sealed class ChatConfig
         ["anthropic"] = "{\"thinking\":{\"type\":\"disabled\"}}",
     };
     public ProxyConfig Proxy { get; set; } = new();
+    public ChatAgentConfig Agent { get; set; } = new();
 }
 
 public sealed class CharacterConfig

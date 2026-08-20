@@ -4,6 +4,8 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -14,12 +16,24 @@ public sealed class ChatMessage
     public string Role { get; set; } = "";
     public string Content { get; set; } = "";
     public DateTime Timestamp { get; set; } = DateTime.Now;
+    /// <summary>可选：随本条消息发送的 PNG base64 图片（视觉模型）。</summary>
+    [JsonIgnore]
+    public List<string>? ImageBase64s { get; set; }
 }
 
 public static class LlamaClient
 {
     private static HttpClient Http = CreateClient();
     private static string? _discoveredModel;
+
+    /// <summary>调试钩子：每次发送请求前回调 (url, 脱敏后的完整请求 JSON)。base64 图片会被替换为长度占位。</summary>
+    public static Action<string, string>? OnRequest;
+
+    private static readonly Regex Base64ImageRegex = new(
+        "data:image/[a-z]+;base64,[A-Za-z0-9+/=]{64,}", RegexOptions.Compiled);
+
+    private static string RedactImages(string json)
+        => Base64ImageRegex.Replace(json, m => "data:<image base64, " + m.Value.Length + " chars>");
 
     private static HttpClient CreateClient()
     {
@@ -60,19 +74,17 @@ public static class LlamaClient
         string? apiKey = null,
         string? extraParams = null,
         CancellationToken ct = default)
-        => await CompleteInternalAsync(baseUrl, messages, model, temperature, maxTokens, apiKey, extraParams, ct, retried: false, imageBase64: null);
+        => await CompleteInternalAsync(baseUrl, messages, model, temperature, maxTokens, apiKey, extraParams, ct, retried: false);
 
-    public static async Task<string> CompleteVisionAsync(
-        string baseUrl,
-        IReadOnlyList<ChatMessage> messages,
-        string imageBase64,
-        string model,
-        double temperature,
-        int maxTokens,
-        string? apiKey = null,
-        string? extraParams = null,
-        CancellationToken ct = default)
-        => await CompleteInternalAsync(baseUrl, messages, model, temperature, maxTokens, apiKey, extraParams, ct, retried: false, imageBase64);
+    private static object ToPayload(ChatMessage m)
+    {
+        if (m.ImageBase64s == null || m.ImageBase64s.Count == 0)
+            return new { role = m.Role, content = m.Content };
+        var parts = new List<object> { new { type = "text", text = m.Content } };
+        foreach (var b in m.ImageBase64s)
+            parts.Add(new { type = "image_url", image_url = new { url = "data:image/png;base64," + b } });
+        return new { role = m.Role, content = parts.ToArray() };
+    }
 
     public static async Task<List<string>> FetchModelsAsync(string baseUrl, string? apiKey = null, CancellationToken ct = default)
     {
@@ -115,33 +127,13 @@ public static class LlamaClient
         string? apiKey,
         string? extraParams,
         CancellationToken ct,
-        bool retried,
-        string? imageBase64 = null)
+        bool retried)
     {
         baseUrl = NormalizeBaseUrl(baseUrl);
         var useModel = string.IsNullOrWhiteSpace(model) ? "local" : model;
         var url = baseUrl + "/v1/chat/completions";
 
-        object[] payloadMessages;
-        if (imageBase64 != null)
-        {
-            payloadMessages = messages.Select((m, i) =>
-                i == messages.Count - 1
-                    ? (object)new
-                    {
-                        role = m.Role,
-                        content = new object[]
-                        {
-                            new { type = "text", text = m.Content },
-                            new { type = "image_url", image_url = new { url = "data:image/png;base64," + imageBase64 } },
-                        },
-                    }
-                    : new { role = m.Role, content = m.Content }).ToArray();
-        }
-        else
-        {
-            payloadMessages = messages.Select(m => new { role = m.Role, content = m.Content }).ToArray();
-        }
+        object[] payloadMessages = messages.Select(ToPayload).ToArray();
 
         var payload = new JsonObject
         {
@@ -168,7 +160,9 @@ public static class LlamaClient
                 // 非法 JSON 的高级参数直接忽略
             }
         }
-        using var content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
+        var json = payload.ToJsonString();
+        if (OnRequest != null) OnRequest(url, RedactImages(json));
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
         if (!string.IsNullOrWhiteSpace(apiKey))
             req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
@@ -181,7 +175,7 @@ public static class LlamaClient
                 var discovered = await DiscoverModelAsync(baseUrl, apiKey, ct);
                 if (!string.IsNullOrEmpty(discovered))
                 {
-                    return await CompleteInternalAsync(baseUrl, messages, discovered, temperature, maxTokens, apiKey, extraParams, ct, retried: true, imageBase64);
+                    return await CompleteInternalAsync(baseUrl, messages, discovered, temperature, maxTokens, apiKey, extraParams, ct, retried: true);
                 }
             }
             throw new Exception($"llama.cpp 请求失败 ({resp.StatusCode}): {Truncate(body, 300)}");
