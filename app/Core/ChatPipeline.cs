@@ -44,6 +44,8 @@ public sealed class ChatPipeline : IDisposable
         }
     }
     public event Action? HistoryChanged;
+    /// <summary>agent 工具调用裁定事件（auto/allowed/denied），已持久化到 agent_ops.json 后在后台线程触发。</summary>
+    public event Action<AgentOpRecord>? OpAdded;
     public bool IsRunning { get; private set; }
 
     /// <summary>线程安全的历史快照（加锁拷贝），UI 线程可放心遍历。</summary>
@@ -56,6 +58,18 @@ public sealed class ChatPipeline : IDisposable
     {
         _config = config;
         _agent = new AgentRunner(config);
+        _agent.OnOp = rec =>
+        {
+            AgentOpLog.Append(_config, rec); // 持久化审计轨迹（内部加锁，后台线程安全）
+            OpAdded?.Invoke(rec);
+        };
+        _agent.OnMessage = m =>
+        {
+            // 工具往返写入长期历史（角色严格交替 user/assistant，Sanitize 不会误合并）；
+            // 后续对话的上下文里就有完整操作轨迹，模型不再"只说不做"。膨胀由记忆压缩兜底。
+            lock (_histLock) _history.Add(new ChatMessage { Role = m.Role, Content = m.Content });
+            NotifyHistory();
+        };
     }
 
     public void Restore(string? summary, IEnumerable<ChatMessage> history)
@@ -83,7 +97,7 @@ public sealed class ChatPipeline : IDisposable
                 clean[clean.Count - 1].Content += "\n" + m.Content;
                 continue;
             }
-            clean.Add(new ChatMessage { Role = m.Role, Content = m.Content });
+            clean.Add(new ChatMessage { Role = m.Role, Content = m.Content, Timestamp = m.Timestamp }); // 保留时间戳：UI 按它与操作记录合并排序
             lastRole = m.Role;
         }
         return clean;
@@ -587,6 +601,7 @@ public sealed class ChatPipeline : IDisposable
 
         List<ChatMessage> chunk;
         lock (_histLock) chunk = _history.GetRange(0, take);
+        MemoryArchive.Append(_config, chunk); // 先归档再压缩：即使摘要失败，原始记录也在 memory_archive.json 里
         _summary = await CompressAsync(chunk, _summary);
         lock (_histLock) _history.RemoveRange(0, Math.Min(take, _history.Count));
         int after;
@@ -693,7 +708,10 @@ public sealed class ChatPipeline : IDisposable
         await _gate.WaitAsync();
         try
         {
-            var result = await CompressAsync(History.ToList(), _summary);
+            List<ChatMessage> chunk;
+            lock (_histLock) chunk = History.ToList();
+            MemoryArchive.Append(_config, chunk); // 归档后再清空
+            var result = await CompressAsync(chunk, _summary);
             lock (_histLock) _history.Clear();
             _lastProactive = null;
             _summary = string.IsNullOrWhiteSpace(result) ? null : result.Trim();

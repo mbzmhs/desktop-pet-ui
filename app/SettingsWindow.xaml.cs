@@ -320,6 +320,7 @@ ExtraParamsBox.Text = CurrentProviderExtra();
         TtsStreamingCheck.IsChecked = _config.Chat.Tts.Streaming;
         ContextLengthBox.Text = _config.Chat.ContextLength.ToString();
         ContextMaxCharsBox.Text = _config.Chat.ContextMaxChars.ToString();
+        ArchiveMaxEntriesBox.Text = _config.Chat.ArchiveMaxEntries.ToString();
         ProactiveIntervalBox.Text = _config.Chat.ProactiveIntervalSec.ToString("0.###");
         IdleIntervalBox.Text = _config.Character.IdleIntervalSec.ToString("0.###");
         BubbleReserveBox.Text = _config.Character.BubbleReserve.ToString("0.###");
@@ -432,6 +433,8 @@ ExtraParamsBox.Text = CurrentProviderExtra();
                 _config.Chat.ContextLength = cl;
             if (int.TryParse(ContextMaxCharsBox.Text?.Trim(), out var cmc) && cmc >= 0)
                 _config.Chat.ContextMaxChars = cmc;
+            if (int.TryParse(ArchiveMaxEntriesBox.Text?.Trim(), out var ame) && ame >= 0)
+                _config.Chat.ArchiveMaxEntries = ame;
             if (double.TryParse(ProactiveIntervalBox.Text?.Trim(), out var pi) && pi > 0)
                 _config.Chat.ProactiveIntervalSec = pi;
             if (double.TryParse(IdleIntervalBox.Text?.Trim(), out var ii) && ii > 0)

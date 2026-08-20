@@ -16,6 +16,12 @@ public sealed class AgentRunner
 
     public Action<string>? DebugLog { get; set; }
 
+    /// <summary>每次工具调用决策后触发（自动放行/用户允许/用户拒绝），由管线负责持久化与广播。</summary>
+    public Action<AgentOpRecord>? OnOp { get; set; }
+
+    /// <summary>循环中每追加一条工作消息（[tool] 调用 / [result] 反馈）触发，由管线写入长期历史。</summary>
+    public Action<ChatMessage>? OnMessage { get; set; }
+
     public AgentRunner(AppConfig config) => _config = config;
 
     /// <summary>
@@ -106,6 +112,23 @@ public sealed class AgentRunner
                             trustNote = "用户已授权目录「" + trustDir + "」：其下文件操作直接放行，字面路径全部位于该目录的 PowerShell 命令也无需再问（无路径/含变量的命令仍会确认）。";
                     }
 
+                    // 审计记录：每次工具调用的裁定都持久化（自动放行 / 用户允许 / 用户拒绝）
+                    var verdict = feedback != null ? "denied" : (tier == ToolTier.Auto ? "auto" : "allowed");
+                    var opNote = verdict switch
+                    {
+                        "auto" => AgentTools.TargetInTrustedDir(call, _config) ? "信任目录" : "",
+                        "allowed" => trustNote != null ? "并信任该目录" : "",
+                        _ => "",
+                    };
+                    OnOp?.Invoke(new AgentOpRecord
+                    {
+                        Tool = call.Name,
+                        Title = call.Title,
+                        Detail = call.Detail,
+                        Verdict = verdict,
+                        Note = opNote,
+                    });
+
                     if (feedback == null)
                     {
                         var result = await AgentTools.ExecuteAsync(call.Name, call.Args, _config, host);
@@ -126,10 +149,13 @@ public sealed class AgentRunner
                 return reply; // 最终回答（情感标签由管线后续解析）
             }
 
-            messages.Add(new ChatMessage { Role = "assistant", Content = reply });
+            var aMsg = new ChatMessage { Role = "assistant", Content = reply };
+            messages.Add(aMsg);
+            OnMessage?.Invoke(aMsg); // 中间往返进长期历史：模型跨对话保留工具用法与操作记忆（opencode 式）
             var fbMsg = new ChatMessage { Role = "user", Content = feedback };
             if (feedbackImages != null) fbMsg.ImageBase64s = feedbackImages;
             messages.Add(fbMsg);
+            OnMessage?.Invoke(new ChatMessage { Role = "user", Content = feedback }); // 只持久化文本，截图 base64 不进 memory.json（防膨胀）
         }
 
         // 步数用尽：强制收束，不再允许工具调用

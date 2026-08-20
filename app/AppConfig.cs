@@ -84,6 +84,7 @@ public sealed class ChatConfig
     public ChatUiConfig Ui { get; set; } = new();
     public int ContextLength { get; set; } = 20;
     public int ContextMaxChars { get; set; } = 4000;
+    public int ArchiveMaxEntries { get; set; } = 5000; // 归档记录上限（条），0=无上限
     public bool Proactive { get; set; } = false;
     public double ProactiveIntervalSec { get; set; } = 30.0;
     public string UserAddress { get; set; } = "";

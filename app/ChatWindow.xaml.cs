@@ -8,6 +8,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using DesktopPetUi.Core;
+using DesktopPetUi.Core.Agent;
 using Brush = System.Windows.Media.Brush;
 using Brushes = System.Windows.Media.Brushes;
 using Color = System.Windows.Media.Color;
@@ -38,16 +39,9 @@ public partial class ChatWindow : Window
         public bool Resolved;
     }
 
-    /// <summary>已决确认的结果行记录（历史消息之外的事件，重建消息流时按时间戳插回原位置）。</summary>
-    private sealed class ConfirmRecord
-    {
-        public DateTime Ts = DateTime.Now;
-        public string Text = "";
-        public bool Allowed;
-    }
-
     private ConfirmCard? _pendingConfirm;
-    private readonly List<ConfirmRecord> _confirmRecords = new(); // 仅 UI 线程读写
+    private List<AgentOpRecord> _ops = new(); // agent 操作日志（磁盘加载 + 实时事件），仅 UI 线程读写
+    private string? _opsChar;                 // 已加载操作日志所属角色（切换角色时自动重载）
 
     public ChatWindow(AppConfig config, ChatPipeline pipeline, Func<Rect?> petRect)
     {
@@ -82,6 +76,7 @@ public partial class ChatWindow : Window
 
         _pipeline.Status = SetStatus;
         _pipeline.HistoryChanged += RebuildMessages;
+        _pipeline.OpAdded += OnOpAdded;
         SizeChanged += (s, e) => SaveLayout(); // 拖角缩放后落盘
         TitleText.Text = "和" + (string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName) + "聊天";
         RebuildMessages();
@@ -91,6 +86,8 @@ public partial class ChatWindow : Window
     public void ShowForInput()
     {
         TitleText.Text = "和" + (string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName) + "聊天";
+        if (WindowState == WindowState.Minimized)
+            WindowState = WindowState.Normal; // 最小化状态下 Show() 只会在任务栏亮一下，需先还原
         ClampToScreen();
         Show();
         Activate();
@@ -103,18 +100,32 @@ public partial class ChatWindow : Window
 
     // ---------------- 位置/尺寸记忆 ----------------
 
-    private void OnTitleBarMouseDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.ButtonState == MouseButtonState.Pressed)
-        {
-            try { DragMove(); } catch { /* 忽略拖动异常 */ }
-            SaveLayout();
-        }
-    }
+    /// <summary>标题栏拖拽由 WindowChrome 原生处理（含双击最大化/还原），松开后落盘位置。</summary>
+    private void OnTitleBarMouseUp(object sender, MouseButtonEventArgs e) => SaveLayout();
 
+    // ---------------- 最小化 / 最大化-还原（与正常 Windows 窗体一致） ----------------
+
+    private void OnMinimizeClick(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
+
+    private void OnMaxRestoreClick(object sender, RoutedEventArgs e) =>
+        WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
+
+    protected override void OnStateChanged(EventArgs e)
+    {
+        base.OnStateChanged(e);
+        try
+        {
+            if (MaxBtn != null)
+                MaxBtn.Content = WindowState == WindowState.Maximized ? "" : ""; // 还原 □ / 最大化 ❐（Segoe MDL2）
+        }
+        catch { /* 忽略 */ }
+        if (WindowState == WindowState.Normal)
+            ClampToScreen(); // 还原后确保回到屏幕可见区域
+    }
 
     private void SaveLayout()
     {
+        if (WindowState != WindowState.Normal) return; // 最大化/最小化几何不入库，还原后仍回记忆位置
         _config.Chat.Ui.X = Left;
         _config.Chat.Ui.Y = Top;
         _config.Chat.Ui.Width = Width;
@@ -155,19 +166,37 @@ public partial class ChatWindow : Window
             return;
         }
         var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
+
+        // 角色切换后重新加载该角色的持久化操作日志（agent_ops.json）
+        var curChar = _config.Character?.Current ?? "";
+        if (curChar != _opsChar)
+        {
+            _opsChar = curChar;
+            _ops = new List<AgentOpRecord>(AgentOpLog.Load(_config));
+        }
+
         MsgPanel.Children.Clear();
 
-        // 历史消息 + 已决确认结果行，按时间戳合并排序（agent 中间叙述不进历史，但确认事件要留在原位置）
+        // 历史消息 + agent 操作记录，按时间戳合并排序（工具往返也进历史了：协议消息渲染成紧凑行，不占气泡）
+        var history = _pipeline.History; // 加锁快照
+        var firstTs = history.Count > 0 ? history.Min(m => m.Timestamp) : DateTime.MaxValue;
         var items = new List<(DateTime Ts, FrameworkElement El)>();
-        foreach (var m in _pipeline.History)
+        foreach (var m in history)
         {
             var isUser = m.Role == "user";
-            items.Add((m.Timestamp, BuildBubble(isUser, isUser ? "你" : name, m.Timestamp, ToDisplay(m.Content))));
+            var el = IsProtocolMessage(m)
+                ? BuildExchangeLine(m)
+                : BuildBubble(isUser, isUser ? "你" : name, m.Timestamp, ToDisplay(m.Content));
+            items.Add((m.Timestamp, el));
         }
-        foreach (var r in _confirmRecords)
-            items.Add((r.Ts, BuildConfirmResultLine(r)));
-        items.Sort((a, b) => a.Ts.CompareTo(b.Ts));
-        foreach (var it in items) MsgPanel.Children.Add(it.El);
+        // 早于第一条聊天记录的 agent 操作不进窗（清空记录后不残留一排孤行）；数据仍在 agent_ops.json，记忆管理器可见可清
+        foreach (var op in _ops.Where(o => o.Ts >= firstTs))
+            items.Add((op.Ts, BuildOpLine(op)));
+        // 稳定排序：时间戳相同（同一毫秒的工具往返）保持插入顺序
+        var ordered = items.Select((it, i) => new { it.El, Ts = it.Ts, I = i })
+                           .OrderBy(x => x.Ts).ThenBy(x => x.I)
+                           .ToList();
+        foreach (var o in ordered) MsgPanel.Children.Add(o.El);
 
         if (_pendingConfirm != null && !_pendingConfirm.Resolved)
             MsgPanel.Children.Add(_pendingConfirm.Card); // 未决确认卡片保持在消息流末尾
@@ -217,6 +246,18 @@ public partial class ChatWindow : Window
             Margin = new Thickness(2, 2, 2, 0),
         });
         return stack;
+    }
+
+    /// <summary>agent 操作裁定事件（后台线程触发）：追加到日志并重建消息流，操作行按时间戳落回原位置。</summary>
+    private void OnOpAdded(AgentOpRecord rec)
+    {
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.BeginInvoke(new Action(() => OnOpAdded(rec)));
+            return;
+        }
+        _ops.Add(rec);
+        RebuildMessages();
     }
 
     // ---------------- 窗口内权限确认 ----------------
@@ -370,15 +411,7 @@ public partial class ChatWindow : Window
         card.Tcs.TrySetResult(new ConfirmResult { Allowed = allowed, TrustFolder = doTrust });
         if (_pendingConfirm == card) _pendingConfirm = null;
 
-        // 卡片收敛为结果行；同时记入事件流，重建消息时按时间戳插回原位置（不会丢）
-        var resultText = !allowed ? "已拒绝" : (doTrust ? "已允许，并信任该目录" : "已允许");
-        _confirmRecords.Add(new ConfirmRecord { Text = resultText, Allowed = allowed });
-        var line = BuildConfirmResultLine(_confirmRecords[^1]);
-        var idx = MsgPanel.Children.IndexOf(card.Card);
-        if (idx >= 0)
-        {
-            MsgPanel.Children[idx] = line;
-        }
+        // 操作日志事件（OpAdded → RebuildMessages）会紧接着把此卡片替换为规范操作行并持久化，无需手动收敛
         ScrollToEnd();
     }
 
@@ -476,14 +509,112 @@ public partial class ChatWindow : Window
         _ => MakeBrush("#4A5568"),
     };
 
-    private static FrameworkElement BuildConfirmResultLine(ConfirmRecord r) => new TextBlock
+    /// <summary>是否 agent 协议消息（[tool] 调用 / [result] [error] [note] 反馈），区别于普通对话。</summary>
+    private static bool IsProtocolMessage(ChatMessage m)
     {
-        Text = "✔ " + r.Text,
-        FontSize = 12,
-        Foreground = MakeBrush(r.Allowed ? "#7FBF8A" : "#BF8A8A"),
-        HorizontalAlignment = HorizontalAlignment.Center,
-        Margin = new Thickness(0, 2, 0, 2),
-    };
+        var c = (m.Content ?? "").TrimStart();
+        if (m.Role == "user")
+            return c.StartsWith("[result]", StringComparison.OrdinalIgnoreCase)
+                || c.StartsWith("[error]", StringComparison.OrdinalIgnoreCase)
+                || c.StartsWith("[note]", StringComparison.OrdinalIgnoreCase);
+        return c.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    /// <summary>工具往返紧凑行：小字号等宽、低对比，贴在消息流里不喧宾夺主。</summary>
+    private FrameworkElement BuildExchangeLine(ChatMessage m)
+    {
+        var c = (m.Content ?? "").Trim();
+        string prefix, text;
+        if (m.Role == "user")
+        {
+            if (c.StartsWith("[note]", StringComparison.OrdinalIgnoreCase)) { prefix = "◈"; text = c.Substring(6).Trim(); }
+            else if (c.StartsWith("[error]", StringComparison.OrdinalIgnoreCase)) { prefix = "!"; text = c.Substring(7).Trim(); }
+            else if (c.StartsWith("[result]", StringComparison.OrdinalIgnoreCase)) { prefix = "↩"; text = c.Substring(8).Trim(); }
+            else { prefix = "↩"; text = c; }
+        }
+        else
+        {
+            var nm = Regex.Match(c, "\"name\"\\s*:\\s*\"([^\"]+)\"", RegexOptions.IgnoreCase);
+            prefix = "⚙";
+            text = nm.Success ? nm.Groups[1].Value : c;
+        }
+        return new TextBlock
+        {
+            Text = prefix + " " + CapText(text, 120).Replace("\n", " ⏎ "),
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 11,
+            Foreground = MakeBrush(m.Role == "user" ? "#667080" : "#8A93A0"),
+            MaxWidth = Math.Max(240, MsgPanel.ActualWidth * 0.9),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 1, 0, 1),
+        };
+    }
+
+    /// <summary>agent 操作记录行（区别于对话气泡）：裁定徽标 + 等宽命令详情 + 时间戳，灰底小卡。</summary>
+    private FrameworkElement BuildOpLine(AgentOpRecord op)
+    {
+        var (badgeText, badgeBgHex) = op.Verdict switch
+        {
+            "allowed" => ("✔ 已允许", "#3A7A4A"),
+            "denied" => ("✘ 已拒绝", "#8A5A5A"),
+            _ => ("⚙ 自动放行", "#5A6A8A"),
+        };
+        var note = string.IsNullOrWhiteSpace(op.Note) ? "" : "（" + op.Note + "）";
+        var detail = CapText(string.IsNullOrWhiteSpace(op.Detail) ? op.Title : op.Detail, 200).Replace("\n", " ⏎ ");
+
+        var grid = new Grid();
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var badge = new Border
+        {
+            CornerRadius = new CornerRadius(9),
+            Padding = new Thickness(8, 1.5, 8, 1.5),
+            Background = MakeBrush(badgeBgHex),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 8, 0),
+        };
+        badge.Child = new TextBlock { Text = badgeText + note, FontSize = 11.5, Foreground = Brushes.White };
+        Grid.SetColumn(badge, 0);
+
+        var detailText = new TextBlock
+        {
+            Text = (string.IsNullOrWhiteSpace(op.Title) ? "" : op.Title + " · ") + detail,
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 12,
+            Foreground = MakeBrush("#9AA3AC"),
+            TextWrapping = TextWrapping.Wrap,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
+        Grid.SetColumn(detailText, 1);
+
+        var ts = new TextBlock
+        {
+            Text = op.Ts.Year >= 2000 ? op.Ts.ToString("MM-dd HH:mm") : "",
+            FontSize = 10.5,
+            Foreground = MakeBrush("#667"),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 0, 0),
+        };
+        Grid.SetColumn(ts, 2);
+
+        grid.Children.Add(badge);
+        grid.Children.Add(detailText);
+        grid.Children.Add(ts);
+
+        return new Border
+        {
+            Background = MakeBrush("#26282C"),
+            CornerRadius = new CornerRadius(8),
+            Padding = new Thickness(10, 5, 10, 5),
+            MaxWidth = Math.Max(260, MsgPanel.ActualWidth * 0.92),
+            Margin = new Thickness(0, 4, 0, 4),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Child = grid,
+        };
+    }
 
     private static string CapText(string s, int max) =>
         string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "\n…（已截断）");

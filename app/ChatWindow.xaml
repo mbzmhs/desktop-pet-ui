@@ -3,17 +3,21 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Chat"
         WindowStyle="None"
-        AllowsTransparency="True"
-        Background="Transparent"
+        Background="#FF202226"
         ShowInTaskbar="False"
-        ResizeMode="CanResizeWithGrip"
+        ResizeMode="CanResize"
         Topmost="True"
         ShowActivated="True">
+    <!-- WindowChrome：保留自定义标题栏，同时获得正常 Windows 窗体的行为（拖拽移动、双击最大化/还原、边缘缩放、Aero Snap） -->
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="36"
+                      ResizeBorderThickness="6"
+                      CornerRadius="0"
+                      GlassFrameThickness="0"
+                      UseAeroCaptionButtons="False"/>
+    </WindowChrome.WindowChrome>
     <Border x:Name="Shell"
-            Background="#EE202226"
-            CornerRadius="10"
-            BorderThickness="1"
-            BorderBrush="#555"
+            Background="#FF202226"
             Padding="10,8">
         <Grid>
             <Grid.RowDefinitions>
@@ -22,8 +26,8 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
-            <!-- 标题栏（拖动移动窗口） -->
-            <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent" MouseLeftButtonDown="OnTitleBarMouseDown">
+            <!-- 标题栏（WindowChrome 原生拖动/双击最大化；按钮需标记 IsHitTestVisibleInChrome） -->
+            <Grid x:Name="TitleBar" Grid.Row="0" Background="Transparent" MouseLeftButtonUp="OnTitleBarMouseUp">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
@@ -33,9 +37,17 @@
                     <TextBlock x:Name="TitleText" Text="聊天" FontSize="14" FontWeight="SemiBold"
                                Foreground="#DDD" VerticalAlignment="Center"/>
                 </StackPanel>
-                <Button x:Name="CloseBtn" Grid.Column="1" Content="✕" Click="OnCloseClick"
-                        Background="Transparent" Foreground="#AAA" BorderThickness="0"
-                        FontSize="14" Padding="6,2" Cursor="Hand" VerticalAlignment="Top"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top">
+                    <Button x:Name="MinBtn" Content="&#xE921;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                            Click="OnMinimizeClick" WindowChrome.IsHitTestVisibleInChrome="True"
+                            Background="Transparent" Foreground="#AAA" BorderThickness="0" Padding="9,5"/>
+                    <Button x:Name="MaxBtn" Content="&#xE922;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                            Click="OnMaxRestoreClick" WindowChrome.IsHitTestVisibleInChrome="True"
+                            Background="Transparent" Foreground="#AAA" BorderThickness="0" Padding="9,5"/>
+                    <Button x:Name="CloseBtn" Content="&#xE8BB;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                            Click="OnCloseClick" WindowChrome.IsHitTestVisibleInChrome="True"
+                            Background="Transparent" Foreground="#AAA" BorderThickness="0" Padding="9,5"/>
+                </StackPanel>
             </Grid>
             <!-- 消息流 -->
             <ScrollViewer x:Name="MsgScroll" Grid.Row="1" Margin="0,8,0,0"
