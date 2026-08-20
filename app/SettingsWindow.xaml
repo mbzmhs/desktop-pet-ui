@@ -380,7 +380,7 @@
                             <ColumnDefinition Width="8"/>
                             <ColumnDefinition Width="70"/>
                         </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="最大工具步数" Foreground="#444" VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="0" Text="最大工具步数（0=不限）" Foreground="#444" VerticalAlignment="Center"/>
                         <TextBox x:Name="AgentMaxStepsBox" Grid.Column="2" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>
                         <TextBlock Grid.Column="4" Text="PowerShell 超时(秒)" Foreground="#444" VerticalAlignment="Center"/>
                         <TextBox x:Name="AgentPsTimeoutBox" Grid.Column="6" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"/>

@@ -150,6 +150,8 @@ public partial class ChatWindow : Window
 
     private void OnMinimizeClick(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
 
+    private void OnTodoClick(object sender, RoutedEventArgs e) => App.ShowTodoWindow();
+
     private void OnMaxRestoreClick(object sender, RoutedEventArgs e) =>
         WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
 

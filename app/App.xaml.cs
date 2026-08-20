@@ -22,6 +22,7 @@ public partial class App : System.Windows.Application
     private SettingsWindow? _settingsWindow;
     private DebugWindow? _debugWindow;
     private MemoryManagerWindow? _memoryWindow;
+    private TodoWindow? _todoWindow;
     private ChatPipeline? _chatPipeline;
     private Hotkey? _hotkey;
     private NotifyIcon? _tray;
@@ -216,7 +217,10 @@ public partial class App : System.Windows.Application
             chat.Click += (_, _) => _chatWindow?.ShowForInput();
             var memory = new System.Windows.Forms.ToolStripMenuItem("记忆管理器…");
             memory.Click += (_, _) => Dispatcher.Invoke(OpenMemoryWindow);
+            var todo = new System.Windows.Forms.ToolStripMenuItem("Todo 列表…");
+            todo.Click += (_, _) => Dispatcher.Invoke(OpenTodoWindow);
             _trayMenu.Items.Add(chat);
+            _trayMenu.Items.Add(todo);
             _trayMenu.Items.Add(memory);
             _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
         }
@@ -261,6 +265,23 @@ public partial class App : System.Windows.Application
         }
         _memoryWindow.Show();
         _memoryWindow.Activate();
+    }
+
+    private void OpenTodoWindow()
+    {
+        if (_todoWindow == null)
+        {
+            _todoWindow = new TodoWindow(Config);
+            _todoWindow.Closed += (_, _) => _todoWindow = null;
+        }
+        _todoWindow.Show();
+        _todoWindow.Activate();
+    }
+
+    /// <summary>聊天窗标题栏入口。</summary>
+    public static void ShowTodoWindow()
+    {
+        if (Current is App app) app.OpenTodoWindow();
     }
 
     private void OpenSettingsWindow()

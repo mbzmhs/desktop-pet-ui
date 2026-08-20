@@ -478,8 +478,8 @@ ExtraParamsBox.Text = CurrentProviderExtra();
         try
         {
             _config.Chat.Agent.Enabled = AgentCheck.IsChecked == true;
-            if (int.TryParse(AgentMaxStepsBox.Text?.Trim(), out var ms) && ms > 0)
-                _config.Chat.Agent.MaxSteps = ms;
+            if (int.TryParse(AgentMaxStepsBox.Text?.Trim(), out var ms) && ms >= 0)
+                _config.Chat.Agent.MaxSteps = ms; // 0 = 不限步数
             if (double.TryParse(AgentPsTimeoutBox.Text?.Trim(), out var pts) && pts >= 5 && pts <= 300)
                 _config.Chat.Agent.PsTimeoutSec = pts;
             if (int.TryParse(AgentReadLinesBox.Text?.Trim(), out var rml) && rml > 0)

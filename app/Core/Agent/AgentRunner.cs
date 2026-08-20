@@ -67,7 +67,9 @@ public sealed class AgentRunner
     /// <summary>执行 agent 循环，返回最终回答文本（不含工具块）。</summary>
     public async Task<string> RunAsync(IReadOnlyList<ChatMessage> seedMessages, ISpeakHost host)
     {
-        var maxSteps = Math.Clamp(_config.Chat.Agent.MaxSteps, 1, 32);
+        // 0（或负数）= 不限步数，与 opencode 一致：循环直到模型不再调工具；正数仍设一个宽松上限防误填天文数字
+        var maxSteps = _config.Chat.Agent.MaxSteps <= 0 ? int.MaxValue : Math.Clamp(_config.Chat.Agent.MaxSteps, 1, 500);
+        var stepsDisplay = maxSteps == int.MaxValue ? "∞" : maxSteps.ToString();
         var messages = new List<ChatMessage>(seedMessages);
 
         for (var step = 1; step <= maxSteps; step++)
@@ -89,7 +91,7 @@ public sealed class AgentRunner
                 }
                 else
                 {
-                    Log.Info($"Agent step {step}/{maxSteps}: {call.Name} raw={EscapeForLog(jsonText)}");
+                    Log.Info($"Agent step {step}/{stepsDisplay}: {call.Name} raw={EscapeForLog(jsonText)}");
                     DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 工具调用: " + call.Name + "  " + call.Description.Replace("\n", " ⏎ "));
 
                     var (tier, autoReason) = AgentTools.Classify(call, _config);

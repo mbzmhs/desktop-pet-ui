@@ -191,6 +191,8 @@ public sealed class ChatPipeline : IDisposable
             JobManager.Prune();
             var jobLine = JobManager.ActiveSummary();
             if (!string.IsNullOrWhiteSpace(jobLine)) parts.Add(jobLine);
+            var todoLine = TodoStore.SummaryLine(_config);
+            if (!string.IsNullOrWhiteSpace(todoLine)) parts.Add(todoLine);
         }
         // 只到日期（不带时分）：时分每轮都变，会击穿前缀缓存；模型需要精确时间时会自己问/用工具查
         var now = DateTime.Now;
@@ -221,12 +223,14 @@ public sealed class ChatPipeline : IDisposable
                "- ask_user(question): ask the user a question and wait for their typed answer (only when you genuinely need info or a choice; never ask what you can find out yourself)\n" +
                "- run_powershell(command, read_only, paths?): run PowerShell synchronously (tasks finishing within ~60s). read_only=true means read-only query. paths = array of ABSOLUTE file/dir paths the command reads/writes — list ALL of them; omitting some is safe (worst case: one extra confirm dialog)\n" +
                "- start_powershell(command, read_only, paths?): start a long task in background, returns a job id (use for tasks likely over 1 minute; paths as above)\n" +
-               "- check_job(job_id): check a background job's progress and output\n" +
+                "- check_job(job_id): check a background job's progress and output\n" +
+                "- todo(action, text?, id?): manage the user-visible task list (shown in a dedicated window). action=add(text=...) to create items, done/undone(id=...), remove(id=...), clear, list. For any non-trivial multi-step task: FIRST add the planned steps, then mark each done IMMEDIATELY as you finish it — the user watches progress live. Items must be concrete, independently completable steps (e.g. \"find file X\", \"write a.txt\") — NEVER create an umbrella/summary item like \"finish the whole task\"; never leave an item unmarked after its step is actually done.\n" +
                "- observe_screen(): capture screenshots of the user's screens and view them. When the user asks what is on their screen / what they are looking at, ALWAYS call this FIRST and answer based only on what you actually see in the images.\n" +
                "HARD RULES:\n" +
                "- To create an empty DIRECTORY, use run_powershell with `New-Item -ItemType Directory` (or mkdir); NEVER use write_file for directories.\n" +
                "- NEVER invent file paths. Before write_file/edit_file/delete_file/search_content, verify the path exists with list_dir or search_files.\n" +
-               "- If a tool returns an error, do NOT retry the identical call; fix the problem (e.g. list the directory to find the exact name) or tell the user what failed.";
+                "- If a tool returns an error, do NOT retry the identical call; fix the problem (e.g. list the directory to find the exact name) or tell the user what failed.\n" +
+                "- NEVER ask the user \"should I continue?\" mid-task. Keep working step by step until every todo item is done or you hit a genuine blocker (unrecoverable error, missing permission/file). Only then stop and report exactly what failed and why.";
     }
 
     /// <summary>工作目录 + 少量已知位置（只给桌面和用户目录，其余位置让模型自己查，不给它猜的素材）。</summary>

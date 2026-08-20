@@ -182,7 +182,7 @@ public static class AgentTools
         "read_file" or "list_dir" or "search_files" or "write_file" or
         "edit_file" or "delete_file" or "search_content" or "web_fetch" or
         "run_powershell" or "start_powershell" or "check_job" or "ask_user" or
-        "observe_screen" => true,
+        "observe_screen" or "todo" => true,
         _ => false,
     };
 
@@ -240,6 +240,10 @@ public static class AgentTools
                 call.Title = "查询后台任务";
                 call.Detail = arg(args, "job_id");
                 break;
+            case "todo":
+                call.Title = "更新 Todo 列表";
+                call.Detail = arg(args, "action") + (string.IsNullOrWhiteSpace(arg(args, "text")) ? "" : "\n" + arg(args, "text"));
+                break;
             case "observe_screen":
                 call.Title = "观察屏幕（截图）";
                 call.Detail = "";
@@ -264,6 +268,7 @@ public static class AgentTools
             case "check_job":
             case "ask_user":
             case "observe_screen":
+            case "todo": // 仅维护可见任务列表，无副作用
                 return (ToolTier.Auto, "");
             case "write_file":
             case "edit_file":
@@ -616,9 +621,17 @@ public static class AgentTools
         var union = new List<string>();
         foreach (var seg in segments)
         {
-            if (IsReadOnlyCommand(seg)) continue;   // 只读段无需路径校验
             var found = ExtractPsPaths(seg);
-            if (found.Count == 0) return false;     // 非只读段却提取不到字面路径（变量/管道来源等）→ 不可判定
+            if (IsReadOnlyCommand(seg))
+            {
+                // 只读段本身无需校验，但其字面路径并入并集：避免「只读读取 + 纯计算」命令因并集为空被拒
+                union.AddRange(found);
+                continue;
+            }
+            // 无字面路径的段：仅当含写/执行 sink（可能作用于未知目标）才不可判定；
+            // 纯计算段（Add-Type、New-Object、变量赋值、非写方法调用等）放行，
+            // 否则「Add-Type; New-Object; $bmp.Save('信任目录\x.png')」这类多语句命令永远弹确认
+            if (found.Count == 0 && SegmentHasSink(seg)) return false;
             union.AddRange(found);
         }
         if (declared != null)
@@ -664,6 +677,27 @@ public static class AgentTools
             }
         }
         return true;
+    }
+
+    /// <summary>段内是否含可能作用于未知目标的写/执行 sink：表达式执行、cmdlet 写动词（New-Object / 纯网络读除外）或 .NET 写方法/静态调用。</summary>
+    private static bool SegmentHasSink(string seg)
+    {
+        // 表达式执行无法用字面路径约束，一律视为 sink
+        if (System.Text.RegularExpressions.Regex.IsMatch(seg, @"\b(iex|Invoke-Expression)\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase)) return true;
+
+        foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(seg, "[A-Za-z][A-Za-z]*-[A-Za-z]+"))
+        {
+            var t = m.Value;
+            if (string.Equals(t, "New-Object", StringComparison.OrdinalIgnoreCase)) continue; // 构造对象本身无副作用
+            // Invoke-WebRequest/Invoke-RestMethod 不带本地写出参数 = 纯网络读，不算 sink
+            if ((t.StartsWith("Invoke-Web", StringComparison.OrdinalIgnoreCase) || string.Equals(t, "Invoke-RestMethod", StringComparison.OrdinalIgnoreCase))
+                && !System.Text.RegularExpressions.Regex.IsMatch(seg, @"-Out(?:File|putFilePath)\b")) continue;
+            if (PsWriteTokens.Any(w => t.StartsWith(w, StringComparison.OrdinalIgnoreCase))) return true;
+        }
+        // .NET 写 sink：实例方法 $x.Save( / .WriteAllText( / .Delete( ... 与静态调用 [IO.File]::WriteAllText( / ::Kill( ...
+        if (System.Text.RegularExpressions.Regex.IsMatch(seg, @"\.(Save|Write|Append|Delete|Move|Copy|Create)\w*\s*\(")) return true;
+        if (System.Text.RegularExpressions.Regex.IsMatch(seg, @"::\s*(Write\w*|Append\w*|Delete|Move|Copy|Kill|Create)\b")) return true;
+        return false;
     }
 
     /// <summary>确认气泡里展示命令涉及的路径（宿主提取 ∪ 模型声明，最多 4 个）。</summary>
@@ -723,6 +757,7 @@ public static class AgentTools
                     return await Task.Run(() => RunPowerShellSync(arg(args, "command"), agent.PsTimeoutSec, cfg));
                 case "start_powershell": return JobManager.Start(arg(args, "command"), cfg);
                 case "check_job": return JobManager.Check(arg(args, "job_id"));
+                case "todo": return TodoAction(arg(args, "action"), args, cfg);
                 case "ask_user":
                     if (host == null) return "错误：当前环境不支持向用户提问";
                     var q = arg(args, "question");
@@ -747,6 +782,50 @@ public static class AgentTools
             Log.Error("AgentTool " + name + " failed", ex);
             return "错误：" + ex.Message;
         }
+    }
+
+    /// <summary>todo 工具：维护用户在 Todo 窗口里可见的任务列表。每次操作后回喂完整列表，模型无需再 list。</summary>
+    private static ToolResult TodoAction(string action, JsonObject args, AppConfig cfg)
+    {
+        switch ((action ?? "").Trim().ToLowerInvariant())
+        {
+            case "add":
+                var text = arg(args, "text");
+                if (string.IsNullOrWhiteSpace(text)) return "错误：add 需要非空的 text";
+                var added = TodoStore.Add(cfg, text);
+                return "Todo 列表已更新：\n" + TodoStore.Render(added) + "\n（完成某项时用 action=done、id=对应编号）";
+            case "done":
+            case "undone":
+                var r1 = TodoStore.SetDone(cfg, GetIntArg(args, "id"), (action ?? "").Trim().ToLowerInvariant() == "done");
+                if (!r1.Ok) return r1.Error;
+                return "Todo 列表已更新：\n" + TodoStore.Render(r1.Items);
+            case "remove":
+                var r2 = TodoStore.Remove(cfg, GetIntArg(args, "id"));
+                if (!r2.Ok) return r2.Error;
+                return "Todo 列表已更新：\n" + TodoStore.Render(r2.Items);
+            case "clear":
+                TodoStore.Clear(cfg);
+                return "Todo 列表已清空。";
+            case "list":
+            default:
+                var snap = TodoStore.Snapshot(cfg);
+                return snap.Count == 0 ? "Todo 列表为空。" : "Todo 列表：\n" + TodoStore.Render(snap);
+        }
+    }
+
+    private static int GetIntArg(JsonObject args, string key)
+    {
+        try
+        {
+            var t = args[key];
+            if (t is JsonValue v)
+            {
+                if (v.TryGetValue<int>(out var i)) return i;
+                if (v.TryGetValue<string>(out var s) && int.TryParse(s.Trim(), out var p)) return p;
+            }
+        }
+        catch { }
+        return -1;
     }
 
     /// <summary>取字符串参数（与 arg 不同：不 Trim，保留 old_string/new_string 的前后空白与换行）。</summary>

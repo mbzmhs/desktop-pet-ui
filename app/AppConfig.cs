@@ -51,7 +51,7 @@ public sealed class ChatUiConfig
 public sealed class ChatAgentConfig
 {
     public bool Enabled { get; set; } = false; // Agent 总开关（false=纯聊天，不注入工具说明）
-    public int MaxSteps { get; set; } = 8;     // 单次对话最大工具调用次数
+    public int MaxSteps { get; set; } = 8;     // 单次对话最大工具调用次数；0=不限（循环直到模型不再调工具）
     public double PsTimeoutSec { get; set; } = 60.0;   // 同步 run_powershell 超时（秒）
     public double JobMaxMinutes { get; set; } = 30.0;  // 后台任务硬上限（分钟），到点强杀
     public int MaxRunningJobs { get; set; } = 4;       // 同时运行的后台任务数上限
