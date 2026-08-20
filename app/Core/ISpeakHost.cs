@@ -42,11 +42,26 @@ public sealed class ConfirmResult
     public bool TrustFolder { get; set; }
 }
 
-/// <summary>用户对提问的回答（Answered=false 表示超时/取消，Text 为空）。</summary>
+/// <summary>opencode 式提问：可带选项（渲染为按钮）、可自由输入、一次多问。</summary>
+public sealed class AskQuestion
+{
+    public string Question { get; set; } = "";
+    /// <summary>候选项（空=纯开放题，只有输入框）。</summary>
+    public List<string> Options { get; set; } = new();
+    /// <summary>是否允许多选。</summary>
+    public bool Multiple { get; set; }
+}
+
+public sealed class AskRequest
+{
+    public List<AskQuestion> Questions { get; set; } = new();
+}
+
+/// <summary>用户对提问的回答：Answers[i] 对应第 i 问（所选选项标签或自由文本，空=该问未答）；Answered=false 表示超时/取消（已填部分仍在 Answers 里）。</summary>
 public sealed class AskResult
 {
     public bool Answered { get; set; }
-    public string Text { get; set; } = "";
+    public List<string> Answers { get; set; } = new();
 }
 
 public interface ISpeakHost
@@ -61,6 +76,6 @@ public interface ISpeakHost
     /// <summary>弹出带 [确认][取消]（必要时另有[信任该目录]）按钮的确认气泡；超时/关闭按取消处理。</summary>
     Task<ConfirmResult> ConfirmAsync(ConfirmRequest request);
 
-    /// <summary>弹出带输入框 + [发送][取消] 的气泡向用户提问，等待用户键入回答；超时/关闭按未回答处理。</summary>
-    Task<AskResult> AskUserAsync(string question);
+    /// <summary>opencode 式提问：选项按钮（可多选）+ 自由输入框，一次可多问；聊天窗可见时由它接管，否则回退宠物气泡。超时/关闭按未回答处理（已填部分保留）。</summary>
+    Task<AskResult> AskUserAsync(AskRequest request);
 }

@@ -225,9 +225,13 @@ public static class AgentTools
                 call.Detail = arg(args, "url");
                 break;
             case "ask_user":
+            {
+                var askQs = ParseAskQuestions(args);
                 call.Title = "向用户提问";
-                call.Detail = arg(args, "question");
+                call.Detail = askQs == null ? ""
+                    : askQs[0].Question + (askQs.Count > 1 ? "\n（另有 " + (askQs.Count - 1) + " 个问题，将一并展示）" : "");
                 break;
+            }
             case "run_powershell":
                 call.Title = "运行 PowerShell 命令";
                 call.Detail = arg(args, "command") + PsPathHintLine(args);
@@ -760,12 +764,20 @@ public static class AgentTools
                 case "todo": return TodoAction(arg(args, "action"), args, cfg);
                 case "ask_user":
                     if (host == null) return "错误：当前环境不支持向用户提问";
-                    var q = arg(args, "question");
-                    if (string.IsNullOrWhiteSpace(q)) return "错误：question 不能为空";
-                    var r = await host.AskUserAsync(q);
-                    return r.Answered
-                        ? "用户回答：" + Truncate(r.Text, 500)
-                        : "用户没有回答（超时或取消）。不要重复问同样的问题，基于已有信息继续，或直接告诉用户你暂时无法完成。";
+                    var askQs = ParseAskQuestions(args);
+                    if (askQs == null) return "错误：question 不能为空";
+                    var r = await host.AskUserAsync(new AskRequest { Questions = askQs });
+                    var ansSb = new StringBuilder();
+                    int answeredCount = 0;
+                    for (var i = 0; i < askQs.Count; i++)
+                    {
+                        var a = (i < r.Answers.Count ? r.Answers[i] : "").Trim();
+                        if (a.Length > 0) answeredCount++;
+                        ansSb.AppendLine((i + 1) + ". " + Truncate(askQs[i].Question, 80) + " → " + (a.Length > 0 ? Truncate(a, 200) : "（未回答）"));
+                    }
+                    if (r.Answered) return "用户回答：\n" + ansSb.ToString().TrimEnd();
+                    if (answeredCount > 0) return "用户只回答了部分问题（超时或取消），不要重复已答的部分，基于已答内容继续：\n" + ansSb.ToString().TrimEnd();
+                    return "用户没有回答（超时或取消）。不要重复问同样的问题，基于已有信息继续，或直接告诉用户你暂时无法完成。";
                 case "observe_screen":
                     var shots = await Task.Run(() => ScreenCapture.CaptureScreens(agent.AgentScreens));
                     var ok = shots.Where(s => !string.IsNullOrEmpty(s)).Cast<string>().ToList();
@@ -1299,6 +1311,43 @@ public static class AgentTools
     private static string arg(JsonObject args, string key) => args[key]?.GetValue<string>()?.Trim() ?? "";
     private static string OrDefault(string v, string d) => string.IsNullOrWhiteSpace(v) ? d : v;
 
+    /// <summary>解析 ask_user 参数：优先 questions 数组（opencode 式多问+选项），回退旧 question 字符串；非法返回 null。
+    /// 限制：≤5 问、每问 ≤6 选项、文本截断防注入超长内容。</summary>
+    private static List<AskQuestion>? ParseAskQuestions(JsonObject args)
+    {
+        var list = new List<AskQuestion>();
+        if (args["questions"] is JsonArray arr)
+        {
+            foreach (var item in arr)
+            {
+                if (item is not JsonObject qo) continue;
+                string text = "";
+                try { text = qo["question"]?.GetValue<string>()?.Trim() ?? ""; } catch { }
+                if (text.Length == 0) continue;
+                if (text.Length > 200) text = text[..200];
+                var q = new AskQuestion { Question = text };
+                if (qo["options"] is JsonArray opts)
+                    foreach (var o in opts)
+                    {
+                        string s = "";
+                        try { s = o?.GetValue<string>()?.Trim() ?? ""; } catch { }
+                        if (s.Length == 0 || q.Options.Count >= 6) continue;
+                        q.Options.Add(s.Length > 40 ? s[..40] : s);
+                    }
+                try { if (qo["multiple"] is JsonValue mv && mv.TryGetValue<bool>(out var mb) && mb) q.Multiple = true; } catch { }
+                list.Add(q);
+            }
+        }
+        if (list.Count == 0)
+        {
+            var single = arg(args, "question");
+            if (string.IsNullOrWhiteSpace(single)) return null;
+            list.Add(new AskQuestion { Question = single.Length > 200 ? single[..200] : single });
+        }
+        if (list.Count > 5) list.RemoveRange(5, list.Count - 5);
+        return list;
+    }
+
     private static bool GetBool(JsonObject args, string key)
     {
         try
@@ -1383,6 +1432,7 @@ public sealed class JobManager
     private sealed class JobState
     {
         public string Id = "";
+        public string Command = "";
         public DateTime StartedAt = DateTime.Now;
         public Process? Proc;
         public readonly object Lock = new();
@@ -1390,6 +1440,18 @@ public sealed class JobManager
         public int? ExitCode;
         public bool TimedOut;
         public long ReadPos; // check_job 已读位置（增量返回）
+    }
+
+    /// <summary>任务快照（后台任务管理器窗口展示用，线程安全拷贝）。</summary>
+    public sealed class JobSnapshot
+    {
+        public string Id = "";
+        public string Command = "";
+        public DateTime StartedAt;
+        public bool Running;
+        public int? ExitCode;
+        public bool TimedOut;
+        public string Tail = ""; // 输出末尾（锁内截取）
     }
 
     private static readonly Dictionary<string, JobState> Jobs = new();
@@ -1408,7 +1470,7 @@ public sealed class JobManager
         }
 
         var id = "job_" + Interlocked.Increment(ref _seq);
-        var job = new JobState { Id = id };
+        var job = new JobState { Id = id, Command = command };
         var psi = new ProcessStartInfo
         {
             FileName = "powershell.exe",
@@ -1539,6 +1601,75 @@ public sealed class JobManager
                            .Select(kv => kv.Key)
                            .ToList();
             foreach (var k in done) Jobs.Remove(k);
+        }
+    }
+
+    /// <summary>全部任务快照（运行中在前，其余按启动时间新→旧），供后台任务管理器窗口展示。</summary>
+    public static List<JobSnapshot> Snapshot()
+    {
+        var list = new List<JobSnapshot>();
+        lock (Gate)
+        {
+            foreach (var j in Jobs.Values)
+            {
+                var proc = j.Proc;
+                bool exited = proc == null || proc.HasExited;
+                int? code = null;
+                string tail;
+                lock (j.Lock)
+                {
+                    if (exited && j.ExitCode == null) j.ExitCode = SafeExitCode(proc);
+                    code = j.ExitCode;
+                    var from = Math.Max(0, j.Buf.Length - 500);
+                    tail = j.Buf.ToString(from, j.Buf.Length - from).Trim();
+                }
+                list.Add(new JobSnapshot
+                {
+                    Id = j.Id,
+                    Command = j.Command,
+                    StartedAt = j.StartedAt,
+                    Running = !exited,
+                    ExitCode = code,
+                    TimedOut = j.TimedOut,
+                    Tail = tail,
+                });
+            }
+        }
+        return list.OrderByDescending(x => x.Running).ThenByDescending(x => x.StartedAt).ToList();
+    }
+
+    /// <summary>手动终止任务（杀整棵进程树）；返回是否找到并处理。</summary>
+    public static bool Kill(string jobId)
+    {
+        JobState? job;
+        lock (Gate)
+        {
+            if (string.IsNullOrWhiteSpace(jobId) || !Jobs.TryGetValue(jobId.Trim(), out job)) return false;
+        }
+        var proc = job.Proc;
+        if (proc == null || proc.HasExited) return true; // 已结束，视为成功
+        try
+        {
+            proc.Kill(entireProcessTree: true);
+            lock (job.Lock) job.TimedOut = false;
+            Append(job, "（用户在后台任务管理器中手动终止）");
+            Log.Info("Job killed by user: " + job.Id);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Kill job failed: " + job.Id, ex);
+            return false;
+        }
+    }
+
+    /// <summary>清除所有已结束的任务（运行中的保留）。</summary>
+    public static void ClearFinished()
+    {
+        lock (Gate)
+        {
+            foreach (var k in Jobs.Where(kv => kv.Value.Proc == null || kv.Value.Proc.HasExited).Select(kv => kv.Key).ToList())
+                Jobs.Remove(k);
         }
     }
 

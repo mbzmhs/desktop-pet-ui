@@ -231,7 +231,7 @@ public sealed class ChatPipeline : IDisposable
                "- delete_file(path): delete a file/folder (always requires user consent)\n" +
                "- search_content(pattern, root_dir?, max_results?): regex content search across files (case-insensitive), returns path:lineNo:line\n" +
                "- web_fetch(url): fetch a web page's main text (http/https only, intranet addresses blocked; plain text, length-capped)\n" +
-               "- ask_user(question): ask the user a question and wait for their typed answer (only when you genuinely need info or a choice; never ask what you can find out yourself)\n" +
+                "- ask_user(questions): ask the user one or SEVERAL questions in a SINGLE call. questions = array of {question: text, options?: [label, ...], multiple?: bool}. Options render as clickable buttons and the user can also type free text per question. ALWAYS provide options when the answer is a pick from a small set (≤6 labels); omit options only for open-ended questions; set multiple=true only if several picks are valid. Use it only when you genuinely need info or a decision — never ask what you can find out yourself\n" +
                "- run_powershell(command, read_only, paths?): run PowerShell synchronously (tasks finishing within ~60s). read_only=true means read-only query. paths = array of ABSOLUTE file/dir paths the command reads/writes — list ALL of them; omitting some is safe (worst case: one extra confirm dialog)\n" +
                "- start_powershell(command, read_only, paths?): start a long task in background, returns a job id (use for tasks likely over 1 minute; paths as above)\n" +
                 "- check_job(job_id): check a background job's progress and output\n" +

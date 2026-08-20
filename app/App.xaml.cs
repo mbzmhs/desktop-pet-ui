@@ -23,6 +23,7 @@ public partial class App : System.Windows.Application
     private DebugWindow? _debugWindow;
     private MemoryManagerWindow? _memoryWindow;
     private TodoWindow? _todoWindow;
+    private JobWindow? _jobWindow;
     private ChatPipeline? _chatPipeline;
     private Hotkey? _hotkey;
     private NotifyIcon? _tray;
@@ -100,8 +101,9 @@ public partial class App : System.Windows.Application
                 LlamaClient.RefreshModelContextAsync(ep0.Url, ep0.Model, ep0.ApiKey);
                 _chatPipeline.HistoryChanged += ScheduleMemorySave; // 历史一变就自动落盘（防抖），意外退出不丢对话
                 _chatWindow = new ChatWindow(Config, _chatPipeline, () => _window?.GetWindowRect());
-                // 聊天窗可见时权限确认在聊天窗内完成，否则回退宠物气泡
+                // 聊天窗可见时权限确认/提问在聊天窗内完成，否则回退宠物气泡
                 _window.ConfirmRedirect = req => _chatWindow!.TryShowConfirmAsync(req);
+                _window.AskRedirect = req => _chatWindow!.TryShowAskAsync(req);
                 _window.ChatRequested = () => Dispatcher.Invoke(() =>
                 {
                     _chatWindow?.ShowForInput();
@@ -219,8 +221,11 @@ public partial class App : System.Windows.Application
             memory.Click += (_, _) => Dispatcher.Invoke(OpenMemoryWindow);
             var todo = new System.Windows.Forms.ToolStripMenuItem("Todo 列表…");
             todo.Click += (_, _) => Dispatcher.Invoke(OpenTodoWindow);
+            var jobs = new System.Windows.Forms.ToolStripMenuItem("后台任务…");
+            jobs.Click += (_, _) => Dispatcher.Invoke(OpenJobWindow);
             _trayMenu.Items.Add(chat);
             _trayMenu.Items.Add(todo);
+            _trayMenu.Items.Add(jobs);
             _trayMenu.Items.Add(memory);
             _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
         }
@@ -278,10 +283,27 @@ public partial class App : System.Windows.Application
         _todoWindow.Activate();
     }
 
+    private void OpenJobWindow()
+    {
+        if (_jobWindow == null)
+        {
+            _jobWindow = new JobWindow();
+            _jobWindow.Closed += (_, _) => _jobWindow = null;
+        }
+        _jobWindow.Show();
+        _jobWindow.Activate();
+    }
+
     /// <summary>聊天窗标题栏入口。</summary>
     public static void ShowTodoWindow()
     {
         if (Current is App app) app.OpenTodoWindow();
+    }
+
+    /// <summary>聊天窗标题栏入口。</summary>
+    public static void ShowJobWindow()
+    {
+        if (Current is App app) app.OpenJobWindow();
     }
 
     private void OpenSettingsWindow()

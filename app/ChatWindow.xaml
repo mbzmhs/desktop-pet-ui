@@ -45,6 +45,9 @@
                     <Button x:Name="TodoBtn" Content="&#xE73B;" FontFamily="Segoe MDL2 Assets" FontSize="10"
                             Click="OnTodoClick" ToolTip="Todo 列表" WindowChrome.IsHitTestVisibleInChrome="True"
                             Background="Transparent" Foreground="#AAA" BorderThickness="0" Padding="9,5"/>
+                    <Button x:Name="JobBtn" Content="&#xE9D2;" FontFamily="Segoe MDL2 Assets" FontSize="10"
+                            Click="OnJobClick" ToolTip="后台任务" WindowChrome.IsHitTestVisibleInChrome="True"
+                            Background="Transparent" Foreground="#AAA" BorderThickness="0" Padding="9,5"/>
                     <Button x:Name="MinBtn" Content="&#xE921;" FontFamily="Segoe MDL2 Assets" FontSize="10"
                             Click="OnMinimizeClick" WindowChrome.IsHitTestVisibleInChrome="True"
                             Background="Transparent" Foreground="#AAA" BorderThickness="0" Padding="9,5"/>

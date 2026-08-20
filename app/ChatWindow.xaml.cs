@@ -15,6 +15,8 @@ using Color = System.Windows.Media.Color;
 using ColorConverter = System.Windows.Media.ColorConverter;
 using FontFamily = System.Windows.Media.FontFamily;
 using Button = System.Windows.Controls.Button;
+using TextBox = System.Windows.Controls.TextBox;
+using WrapPanel = System.Windows.Controls.WrapPanel;
 using Border = System.Windows.Controls.Border;
 using Orientation = System.Windows.Controls.Orientation;
 using KeyEventArgs = System.Windows.Input.KeyEventArgs;
@@ -39,7 +41,18 @@ public partial class ChatWindow : Window
         public bool Resolved;
     }
 
+    private sealed class AskCard
+    {
+        public AskRequest Request = null!;
+        public TaskCompletionSource<AskResult> Tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public FrameworkElement Card = null!;
+        public bool Resolved;
+        public List<List<int>> Selections = new(); // 每问已选选项下标
+        public List<TextBox> Inputs = new();       // 每问自由输入框
+    }
+
     private ConfirmCard? _pendingConfirm;
+    private AskCard? _pendingAsk;
     private List<AgentOpRecord> _ops = new(); // agent 操作日志（磁盘加载 + 实时事件），仅 UI 线程读写
     private string? _opsChar;                 // 已加载操作日志所属角色（切换角色时自动重载）
 
@@ -152,6 +165,8 @@ public partial class ChatWindow : Window
 
     private void OnTodoClick(object sender, RoutedEventArgs e) => App.ShowTodoWindow();
 
+    private void OnJobClick(object sender, RoutedEventArgs e) => App.ShowJobWindow();
+
     private void OnMaxRestoreClick(object sender, RoutedEventArgs e) =>
         WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
 
@@ -245,6 +260,8 @@ public partial class ChatWindow : Window
 
         if (_pendingConfirm != null && !_pendingConfirm.Resolved)
             MsgPanel.Children.Add(_pendingConfirm.Card); // 未决确认卡片保持在消息流末尾
+        if (_pendingAsk != null && !_pendingAsk.Resolved)
+            MsgPanel.Children.Add(_pendingAsk.Card);     // 未决提问卡片同理
         ScrollToEnd();
     }
 
@@ -460,12 +477,162 @@ public partial class ChatWindow : Window
         ScrollToEnd();
     }
 
-    /// <summary>窗口关闭/隐藏时若有未决确认，按拒绝处理（与宠物气泡超时语义一致）。</summary>
+    /// <summary>窗口关闭/隐藏时若有未决确认/提问，按拒绝处理（与宠物气泡超时语义一致）。</summary>
     private void RejectPendingConfirm()
     {
         var card = _pendingConfirm;
-        if (card == null || card.Resolved) return;
-        ResolveConfirm(card, allowed: false, trust: false);
+        if (card != null && !card.Resolved) ResolveConfirm(card, allowed: false, trust: false);
+        var ask = _pendingAsk;
+        if (ask != null && !ask.Resolved) ResolveAsk(ask, answered: false);
+    }
+
+    // ---------------- 窗内 opencode 式提问（选项按钮 + 自由输入，一次可多问） ----------------
+
+    /// <summary>聊天窗可见时接管 ask_user；不可见/已有未决卡片返回 null，调用方回退宠物气泡。</summary>
+    public Task<AskResult>? TryShowAskAsync(AskRequest req)
+    {
+        if (!Dispatcher.CheckAccess())
+            return Dispatcher.Invoke(() => TryShowAskAsync(req)); // 窗口属性必须在 UI 线程读
+        if (!IsVisible || _pendingConfirm != null || _pendingAsk != null) return null;
+
+        var card = new AskCard { Request = req };
+        BuildAskCard(card);
+        _pendingAsk = card;
+        MsgPanel.Children.Add(card.Card);
+        ScrollToEnd();
+        Activate(); // 提亮窗口提醒用户
+        return card.Tcs.Task;
+    }
+
+    private void BuildAskCard(AskCard card)
+    {
+        var req = card.Request;
+        var root = new StackPanel
+        {
+            MaxWidth = Math.Max(260, MsgPanel.ActualWidth * 0.92),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 8, 0, 8),
+        };
+        var border = new Border
+        {
+            Background = MakeBrush("#2A2D33"),
+            BorderBrush = MakeBrush("#5A6A8A"),
+            BorderThickness = new Thickness(1.5),
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(12, 9, 12, 9),
+        };
+        var inner = new StackPanel();
+
+        inner.Children.Add(new TextBlock
+        {
+            Text = req.Questions.Count > 1 ? "有 " + req.Questions.Count + " 个问题需要你确认" : "想问你一个问题",
+            FontWeight = FontWeights.SemiBold, FontSize = 14, Foreground = MakeBrush("#EEE"),
+        });
+
+        for (var i = 0; i < req.Questions.Count; i++)
+        {
+            int qi = i; // for 循环变量会被 lambda 共享，必须捕获每轮副本
+            var q = req.Questions[i];
+            var section = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
+            section.Children.Add(new TextBlock
+            {
+                Text = (req.Questions.Count > 1 ? (qi + 1) + ". " : "") + q.Question,
+                FontSize = 13.5, LineHeight = 19, Foreground = MakeBrush("#DDD"), TextWrapping = TextWrapping.Wrap,
+            });
+
+            var selected = new bool[q.Options.Count];
+            card.Selections.Add(new List<int>());
+            if (q.Options.Count > 0)
+            {
+                var wrap = new WrapPanel { Margin = new Thickness(0, 6, 0, 0) };
+                var optBtns = new List<Button>();
+                for (var j = 0; j < q.Options.Count; j++)
+                {
+                    int idx = j;
+                    var b = new Button
+                    {
+                        Content = q.Options[j],
+                        Foreground = Brushes.White,
+                        Padding = new Thickness(12, 4, 12, 4),
+                        Margin = new Thickness(0, 0, 8, 6),
+                        FontSize = 13,
+                        Cursor = Cursors.Hand,
+                    };
+                    StyleAskOption(b, false);
+                    b.Click += (_, _) =>
+                    {
+                        if (card.Resolved) return;
+                        bool on = !selected[idx];
+                        if (q.Multiple) selected[idx] = on;
+                        else for (var k = 0; k < selected.Length; k++) selected[k] = (k == idx && on);
+                        for (var k = 0; k < optBtns.Count; k++) StyleAskOption(optBtns[k], selected[k]);
+                        var selList = card.Selections[qi];
+                        selList.Clear();
+                        for (var k = 0; k < selected.Length; k++) if (selected[k]) selList.Add(k);
+                    };
+                    optBtns.Add(b);
+                    wrap.Children.Add(b);
+                }
+                section.Children.Add(wrap);
+            }
+
+            section.Children.Add(new TextBlock
+            {
+                Text = q.Options.Count > 0 ? "或直接输入：" : "输入回答：",
+                FontSize = 11, Foreground = MakeBrush("#8A93A6"), Margin = new Thickness(0, 4, 0, 2)
+            });
+            var tb = new TextBox
+            {
+                Background = MakeBrush("#26282C"), Foreground = MakeBrush("#EEE"), CaretBrush = MakeBrush("#EEE"),
+                BorderBrush = MakeBrush("#454B57"), BorderThickness = new Thickness(1),
+                FontSize = 13, Padding = new Thickness(6, 4, 6, 4), MaxWidth = 320,
+            };
+            tb.KeyDown += (_, ke) => { if (ke.Key == Key.Enter) { ke.Handled = true; ResolveAsk(card, answered: true); } }; // 回车=提交全部
+            section.Children.Add(tb);
+            card.Inputs.Add(tb);
+            inner.Children.Add(section);
+        }
+
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 12, 0, 0) };
+        buttons.Children.Add(MakeConfirmButton("提交", "#3A7A4A", () => ResolveAsk(card, answered: true)));
+        buttons.Children.Add(MakeConfirmButton("取消", "#8A5A5A", () => ResolveAsk(card, answered: false), leftMargin: 8));
+        inner.Children.Add(buttons);
+
+        border.Child = inner;
+        root.Children.Add(border);
+        card.Card = root;
+    }
+
+    private static void StyleAskOption(Button b, bool isSelected)
+    {
+        b.Background = MakeBrush(isSelected ? "#3D7EBF" : "#26282C");
+        b.BorderBrush = MakeBrush(isSelected ? "#3D7EBF" : "#454B57");
+        b.BorderThickness = new Thickness(1);
+    }
+
+    /// <summary>汇总答案：每问「输入框非空→用文本，否则所选选项（多选以、连接）」；answered=false 时已填部分仍带回。</summary>
+    private void ResolveAsk(AskCard card, bool answered)
+    {
+        if (card.Resolved) return;
+        card.Resolved = true;
+        try { card.Card.IsEnabled = false; } catch { } // 点下任意选项的瞬间整卡失效
+
+        var answers = new List<string>();
+        for (var i = 0; i < card.Request.Questions.Count; i++)
+        {
+            var q = card.Request.Questions[i];
+            var text = i < card.Inputs.Count ? (card.Inputs[i].Text ?? "").Trim() : "";
+            if (text.Length > 0)
+            {
+                answers.Add(text);
+                continue;
+            }
+            var sel = i < card.Selections.Count ? card.Selections[i] : new List<int>();
+            answers.Add(sel.Count == 0 ? "" : string.Join("、", sel.OrderBy(x => x).Select(x => q.Options[x])));
+        }
+        card.Tcs.TrySetResult(new AskResult { Answered = answered, Answers = answers });
+        if (_pendingAsk == card) _pendingAsk = null;
+        ScrollToEnd();
     }
 
     // ---------------- 输入 ----------------

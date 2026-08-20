@@ -53,6 +53,9 @@ public partial class PetWindow : Window, ISpeakHost
     private TaskCompletionSource<AskResult>? _askTcs;
     private bool? _confirmPrevOverride;
     private string? _confirmTrustDir; // 本次确认可一键信任的目录（null=不显示该按钮）
+    private AskRequest? _askReq;         // 当前提问（opencode 式多问）
+    private List<string>? _askAnswers;   // 每问答案（空=未答；多选以、连接）
+    private List<List<System.Windows.Controls.Button>>? _askOptBtns; // 每问的选项按钮（重绘选中态用）
     private DispatcherTimer? _confirmTimer; // 确认/提问气泡共用超时定时器
     private double _dialogGrowDelta;    // 本次对话框为容纳内容临时向上扩大的窗口高度（关闭时还原）
     private double _dialogExtraReserve; // 与 _dialogGrowDelta 配套的额外气泡预留（扩大时立绘尺寸不变）
@@ -806,6 +809,9 @@ public partial class PetWindow : Window, ISpeakHost
     /// <summary>确认重定向：聊天窗可见时由它接管确认；返回 null 表示回退到本窗气泡。</summary>
     public Func<ConfirmRequest, Task<ConfirmResult>?>? ConfirmRedirect { get; set; }
 
+    /// <summary>提问重定向：聊天窗可见时由它接管 opencode 式提问；返回 null 表示回退到本窗气泡。</summary>
+    public Func<AskRequest, Task<AskResult>?>? AskRedirect { get; set; }
+
     /// <summary>弹出带 [确认][取消]（必要时另有[信任该目录]）按钮的气泡，等待用户点击；超时按取消处理。</summary>
     public async Task<ConfirmResult> ConfirmAsync(ConfirmRequest request)
     {
@@ -847,36 +853,153 @@ public partial class PetWindow : Window, ISpeakHost
         return await tcs.Task;
     }
 
-    /// <summary>弹出带输入框 + [发送][取消] 的气泡向用户提问，等待用户键入回答；超时/关闭按未回答处理。</summary>
-    public Task<AskResult> AskUserAsync(string question)
+    /// <summary>opencode 式提问（选项按钮+输入，一次可多问）；聊天窗可见时由它接管，否则回退本窗气泡。超时/关闭按未回答处理（已填部分保留）。</summary>
+    public async Task<AskResult> AskUserAsync(AskRequest request)
     {
-        var tcs = new TaskCompletionSource<AskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var n = request?.Questions.Count ?? 0;
         if (_confirmTcs != null || _askTcs != null)
+            return new AskResult { Answered = false, Answers = EmptyAnswers(n) }; // 已有气泡在等用户
+
+        // 聊天窗开着时在聊天窗内提问（不弹宠物气泡）
+        var redirect = AskRedirect;
+        if (redirect != null)
         {
-            tcs.TrySetResult(new AskResult { Answered = false }); // 已有气泡在等用户，直接返回未回答
-            return tcs.Task;
+            try
+            {
+                var task = redirect(request);
+                if (task != null) return await task;
+            }
+            catch { /* 重定向失败则回退气泡 */ }
         }
+
+        var tcs = new TaskCompletionSource<AskResult>(TaskCreationOptions.RunContinuationsAsynchronously);
         _askTcs = tcs;
+        _askReq = request;
+        _askAnswers = EmptyAnswers(n);
         try
         {
             EnsureDialogTimer();
-            System.Windows.Application.Current.Dispatcher.InvokeAsync(() =>
-            {
-                ShowDialogChrome(question ?? "");
-                ConfirmYesBtn.Visibility = Visibility.Collapsed;
-                ConfirmTrustBtn.Visibility = Visibility.Collapsed;
-                AskInputBox.Clear();
-                TextInputRow.Visibility = Visibility.Visible;
-                ApplyEmotion("curious"); // 提问表情（缺失时回退 idle）
-                System.Windows.Input.Keyboard.Focus(AskInputBox);
-            });
+            System.Windows.Application.Current.Dispatcher.InvokeAsync(() => ShowAskChrome(request));
         }
         catch (Exception ex)
         {
             Log.Error("AskUserAsync dispatch failed", ex);
-            tcs.TrySetResult(new AskResult { Answered = false });
+            CleanupAskState();
+            tcs.TrySetResult(new AskResult { Answered = false, Answers = EmptyAnswers(n) });
         }
-        return tcs.Task;
+        return await tcs.Task;
+    }
+
+    private static List<string> EmptyAnswers(int n)
+    {
+        var l = new List<string>();
+        for (var i = 0; i < Math.Max(0, n); i++) l.Add("");
+        return l;
+    }
+
+    private void CleanupAskState()
+    {
+        _askReq = null;
+        _askAnswers = null;
+        _askOptBtns = null;
+    }
+
+    /// <summary>提问气泡（可多问）：编号问题列表 + 每问选项按钮（点击选择/多选切换）+ 共享输入行（文本记入第一个未答的问题）。</summary>
+    private void ShowAskChrome(AskRequest req)
+    {
+        BeginDialogChrome();
+        BubbleTitleRow.Visibility = Visibility.Collapsed;
+        BubbleRiskNote.Visibility = Visibility.Collapsed;
+        BubbleDetailBox.Visibility = Visibility.Collapsed;
+
+        var sb = new System.Text.StringBuilder();
+        for (var i = 0; i < req.Questions.Count; i++)
+        {
+            var q = req.Questions[i];
+            if (req.Questions.Count > 1) sb.Append(i + 1).Append(". ");
+            sb.AppendLine(q.Question);
+            if (q.Options.Count > 0) sb.AppendLine("选项：" + string.Join(" / ", q.Options));
+        }
+        BubbleText.Visibility = Visibility.Visible;
+        BubbleText.Text = CapText(sb.ToString().TrimEnd(), 1200);
+
+        // 每问一行选项按钮（多问时带 Qn 前缀）
+        BubbleButtons.Children.Clear();
+        _askOptBtns = new List<List<System.Windows.Controls.Button>>();
+        for (var i = 0; i < req.Questions.Count; i++)
+        {
+            var q = req.Questions[i];
+            if (q.Options.Count == 0) { _askOptBtns.Add(new List<System.Windows.Controls.Button>()); continue; }
+            int qi = i;
+            var row = new System.Windows.Controls.StackPanel();
+            var btns = new List<System.Windows.Controls.Button>();
+            for (var j = 0; j < q.Options.Count; j++)
+            {
+                int oj = j;
+                var b = MakeAskOptionButton((req.Questions.Count > 1 ? "Q" + (qi + 1) + " " : "") + q.Options[oj], false);
+                b.Click += (_, _) => ToggleAskOption(qi, oj, q.Multiple);
+                btns.Add(b);
+                row.Children.Add(b);
+            }
+            _askOptBtns.Add(btns);
+            BubbleButtons.Children.Add(row);
+        }
+
+        ConfirmYesBtn.Visibility = Visibility.Collapsed;
+        ConfirmTrustBtn.Visibility = Visibility.Collapsed;
+        AskInputBox.Clear();
+        TextInputRow.Visibility = Visibility.Visible;
+        ApplyEmotion("curious"); // 提问表情（缺失时回退 idle）
+        System.Windows.Input.Keyboard.Focus(AskInputBox);
+        EndDialogChrome();
+    }
+
+    private static System.Windows.Controls.Button MakeAskOptionButton(string text, bool selected)
+    {
+        var b = new System.Windows.Controls.Button
+        {
+            Content = text,
+            Foreground = System.Windows.Media.Brushes.White,
+            Padding = new Thickness(10, 3, 10, 3),
+            Margin = new Thickness(0, 2, 6, 2),
+            FontSize = 12.5,
+            Cursor = System.Windows.Input.Cursors.Hand,
+        };
+        StyleAskOptionPet(b, selected);
+        return b;
+    }
+
+    private static void StyleAskOptionPet(System.Windows.Controls.Button b, bool selected)
+    {
+        b.Background = MakeBrush(selected ? "#3D7EBF" : "#26282C");
+        b.BorderBrush = MakeBrush(selected ? "#3D7EBF" : "#454B57");
+        b.BorderThickness = new Thickness(1);
+    }
+
+    /// <summary>点选项：单选替换、多选切换；重绘该问全部按钮的选中态。</summary>
+    private void ToggleAskOption(int qi, int oj, bool multiple)
+    {
+        if (_askReq == null || _askAnswers == null || qi >= _askReq.Questions.Count) return;
+        var q = _askReq.Questions[qi];
+        if (oj >= q.Options.Count) return;
+        var cur = _askAnswers[qi];
+        if (multiple)
+        {
+            var parts = cur.Length == 0 ? new List<string>() : cur.Split('、').ToList();
+            if (parts.Contains(q.Options[oj])) parts.Remove(q.Options[oj]);
+            else parts.Add(q.Options[oj]);
+            _askAnswers[qi] = string.Join("、", parts);
+        }
+        else
+        {
+            _askAnswers[qi] = cur == q.Options[oj] ? "" : q.Options[oj];
+        }
+        if (_askOptBtns != null && qi < _askOptBtns.Count)
+        {
+            var curSet = _askAnswers[qi].Length == 0 ? new List<string>() : _askAnswers[qi].Split('、').ToList();
+            for (var k = 0; k < _askOptBtns[qi].Count; k++)
+                StyleAskOptionPet(_askOptBtns[qi][k], curSet.Contains(q.Options[k]));
+        }
     }
 
     private void EnsureDialogTimer()
@@ -1055,7 +1178,15 @@ public partial class PetWindow : Window, ISpeakHost
         }
     }
 
-    private void SendAskAnswer() => FinishActiveDialog(answered: true, text: AskInputBox.Text?.Trim() ?? "");
+    /// <summary>输入行发送：文本记入第一个未答的问题，然后提交全部。</summary>
+    private void SendAskAnswer()
+    {
+        var text = AskInputBox.Text?.Trim() ?? "";
+        if (_askAnswers != null && text.Length > 0)
+            for (var i = 0; i < _askAnswers.Count; i++)
+                if (_askAnswers[i].Length == 0) { _askAnswers[i] = text; break; }
+        FinishActiveDialog(answered: true, text: text);
+    }
 
     /// <summary>当前活动气泡结束（点击/超时），幂等：只有第一个结果生效。确认与提问两种模式共用。</summary>
     private void FinishActiveDialog(bool answered, bool timedOut = false, string? text = null, bool trustFolder = false)
@@ -1068,14 +1199,17 @@ public partial class PetWindow : Window, ISpeakHost
         }
         else if (_askTcs != null)
         {
-            _askTcs.TrySetResult(new AskResult { Answered = answered && !timedOut, Text = (answered && !timedOut) ? text ?? "" : "" });
-            Log.Info("Agent ask: " + (!timedOut ? ("answered: " + TruncateLog(text)) : "timeout, treated as no answer"));
+            var okAsk = answered && !timedOut;
+            var answers = _askAnswers ?? new List<string>(); // 超时/取消时已填部分仍带回
+            _askTcs.TrySetResult(new AskResult { Answered = okAsk, Answers = answers });
+            Log.Info("Agent ask: " + (okAsk ? ("answered: " + TruncateLog(string.Join(" | ", answers))) : timedOut ? "timeout, partial answers kept" : "cancelled"));
         }
         else return;
 
         _confirmTcs = null;
         _askTcs = null;
         _confirmTrustDir = null;
+        CleanupAskState();
         _confirmTimer?.Stop();
         _clickThroughOverride = _confirmPrevOverride; // 恢复正常鼠标穿透采样
         RestoreDialogWindow(); // 还原为对话框期间的临时扩窗
