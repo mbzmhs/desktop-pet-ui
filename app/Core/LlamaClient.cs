@@ -18,6 +18,10 @@ public sealed class ChatMessage
     public string Role { get; set; } = "";
     public string Content { get; set; } = "";
     public DateTime Timestamp { get; set; } = DateTime.Now;
+    /// <summary>可选：仅 event 消息携带的"每事件指令"（插件 BuildEventInstruction 给出，如礼物必谢点名）。
+    /// ToPayload 时拼进发给模型的 user 消息尾部；不进 UI、不写 memory.json（临时决策辅助，非持久对话）。</summary>
+    [JsonIgnore]
+    public string? Instruction { get; set; }
     /// <summary>可选：随本条消息发送的 PNG base64 图片（视觉模型）。</summary>
     [JsonIgnore]
     public List<string>? ImageBase64s { get; set; }
@@ -247,8 +251,16 @@ public static class LlamaClient
 
     private static object ToPayload(ChatMessage m)
     {
-        // event（第三方事件，如直播间弹幕）对模型呈现为 system 叙述者：与 user 严格区分，防模型把观众发言当用户说的话
-        var role = m.Role == "event" ? "system" : m.Role;
+        // event（第三方事件，如直播间弹幕）：观众内容 + 插件每事件指令合并成**一条 user 消息**——
+        // 不用 system（llama.cpp/Qwen jinja 模板不允许中途/多条 system，会报错）；整体带 [SYSTEM] 标记，
+        // 依 LIVE ROOM MODE"只有无标记 user 才是用户本人"规则排除出"用户"，防模型把观众当主人。指令在尾部=决策点。
+        if (m.Role == "event")
+        {
+            var c = "[SYSTEM] " + m.Content
+                  + (string.IsNullOrWhiteSpace(m.Instruction) ? "" : "\n" + m.Instruction);
+            return new { role = "user", content = c };
+        }
+        var role = m.Role;
         if (m.ImageBase64s == null || m.ImageBase64s.Count == 0)
             return new { role, content = m.Content };
         var parts = new List<object> { new { type = "text", text = m.Content } };

@@ -480,8 +480,9 @@ public sealed class ChatPipeline : IDisposable
 
     public Task<bool> RunAsync(string userText, ISpeakHost host) => RunAsync(userText, host, asEvent: false);
 
-    /// <param name="asEvent">true=第三方事件（插件 SendEventAsync，如直播间弹幕）：历史记 Role="event"，
-    /// 对模型呈现为 system（叙述者）而非 user——模型不会把观众发言当成用户本人说的话；聊天窗用独立紧凑样式。</param>
+    /// <param name="asEvent">true=第三方事件（插件 SendEventAsync，如直播间弹幕）：历史记 Role="event"（内容+eventInstruction 指令合并一条），
+    /// ToPayload 呈现为**带 [SYSTEM] 标记的 user 消息**（非 system——中途/多条 system 会让 llama.cpp/Qwen jinja 模板报错；
+    /// [SYSTEM] 标记依 LIVE ROOM MODE 规则排除出"用户本人"，防模型把观众当主人）；聊天窗用独立紧凑样式。</param>
     /// <param name="allowAgent">false=本轮不启用 agent 工具链（即使全局开启）：第三方事件默认 false，防不可信内容注入电脑操作指令。</param>
     public async Task<bool> RunAsync(string userText, ISpeakHost host, bool asEvent, bool allowAgent = true, string? eventInstruction = null)
     {
@@ -494,11 +495,13 @@ public sealed class ChatPipeline : IDisposable
         {
             lock (_histLock)
             {
-                _history.Add(new ChatMessage { Role = asEvent ? "event" : "user", Content = userText });
+                // event：观众内容 + 插件每事件指令合并存一条（Role="event"，指令在 Instruction 字段）。
+                // ToPayload 时拼成**一条 user 消息**（[SYSTEM] 标记 + 内容 + 尾部指令）——不再用中途 system（jinja 模板报错），
+                // 也不再有独立的 [SYSTEM] user 条目；每事件恰好一条 user，前后必有 assistant，严格交替。
                 if (asEvent)
-                    // 事件后紧跟一条持久化 user 触发（同主动搭话的沉默回合同构）：wire 呈 event(system)→user→assistant 正常交替，
-                    // DeepSeek 不再丢弃中间 system / 合并重复会话；这条也是留给模型的持久痕迹，且只此一次 LLM 调用
-                    _history.Add(new ChatMessage { Role = "user", Content = EventReplyTrigger(eventInstruction) });
+                    _history.Add(new ChatMessage { Role = "event", Content = userText, Instruction = eventInstruction });
+                else
+                    _history.Add(new ChatMessage { Role = "user", Content = userText });
             }
             NotifyHistory();
             Status?.Invoke("思考中…");
@@ -650,16 +653,7 @@ public sealed class ChatPipeline : IDisposable
         return SysPrefix() + arr[Random.Shared.Next(arr.Length)];
     }
 
-    /// <summary>事件（弹幕/礼物等）入库后紧跟的 user 触发：让 wire 以 user 收尾、正常交替，模型据此决定是否回应。
-    /// 必须带 [SYSTEM] 标记——LIVE ROOM MODE 规则是"Only UNMARKED messages come from your user"，无标记的 user 消息会被当成用户本人，
-    /// 导致角色把观众弹幕误当用户的话来回应；标成系统转发后即被排除出"用户"，并明确指示回应的是那位观众而非用户。
-    /// 跳过机制（输出什么、如何表示不回应）归插件的 system prompt 定义，这里只要求"回应这位观众或保持沉默"。固定英文（不在 UI 显示）。</summary>
-    // 宿主只是 [SYSTEM] 结构包装：把插件给出的每事件指令原样放进 user 触发词（尾部，贴近决策点、比 system 头部遵循度更高）。
-    // 不含任何处理策略；插件未给指令时给一条最中性兜底。彻底解耦——"怎么回/跳过/格式/别续旧话题"全由插件在指令里决定。
-    private string EventReplyTrigger(string? pluginInstruction = null)
-        => SysPrefix() + (string.IsNullOrWhiteSpace(pluginInstruction) ? "(Handle the event above per your rules.)" : pluginInstruction);
-
-    // 固定英文 + [SYSTEM] 前缀（与事件触发/沉默指令同约定）：只进模型上下文、不在 UI 显示，英文对指令遵循最稳。
+    // 固定英文 + [SYSTEM] 前缀（与沉默指令同约定）：只进模型上下文、不在 UI 显示，英文对指令遵循最稳。
     // 回复语言由主 system prompt 的 LANGUAGE 段决定，这里用英文不影响角色用配置语言搭话。
     private string ProactiveInstruction()
         => SysPrefix() + "PROACTIVE TURN: It is your turn to start a conversation; the user has been silent for a while. Do NOT continue the past conversation (summary) — bring up ONE new topic (today's events, hobbies, how the user is doing, etc.). Keep it to at most one sentence and avoid repeating phrases or topics you have used before. Start your reply with one emotion tag.";
