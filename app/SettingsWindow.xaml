@@ -465,6 +465,45 @@
                 </StackPanel>
             </ScrollViewer>
         </TabItem>
+
+        <TabItem Header="插件设置" Background="#FFFFFF">
+            <Grid Margin="12" Background="#FFFFFF">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="230"/>
+                    <ColumnDefinition Width="12"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- 左：插件列表（文件名顺序=消息链顺序；勾选框=启用/禁用，热生效无需重启） -->
+                <ListBox x:Name="PluginList" Grid.Column="0" Background="#FFFFFF" Foreground="#222" BorderBrush="#C8C8C8"
+                         MinHeight="360" SelectionChanged="OnPluginSelected">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <StackPanel Orientation="Horizontal" Margin="2,4">
+                                <CheckBox IsChecked="{Binding IsEnabled, Mode=TwoWay}" VerticalAlignment="Center"/>
+                                <TextBlock Text="{Binding Title}" Margin="6,0,0,0" VerticalAlignment="Center" TextWrapping="Wrap" Foreground="#222"/>
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <!-- 右：详情 + 设定 -->
+                <StackPanel Grid.Column="2">
+                    <TextBlock x:Name="PluginTitle" Text="选择左侧插件查看详情" Foreground="#2A5C8A" FontWeight="Bold" Margin="0,0,0,8"/>
+                    <TextBlock x:Name="PluginMeta" Foreground="#666" Margin="0,0,0,4" TextWrapping="Wrap"/>
+                    <TextBlock x:Name="PluginDesc" Foreground="#444" Margin="0,0,0,8" TextWrapping="Wrap"/>
+                    <TextBlock x:Name="PluginError" Foreground="#E86C6C" Margin="0,0,0,8" TextWrapping="Wrap" Visibility="Collapsed"/>
+
+                    <TextBlock Text="设定" Foreground="#2A5C8A" FontWeight="Bold" Margin="0,0,0,6"/>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" MaxHeight="320">
+                        <StackPanel x:Name="PluginSettingsPanel"/>
+                    </ScrollViewer>
+
+                    <Button x:Name="PluginSaveBtn" Content="保存设定" Click="OnPluginSettingsSave" Margin="0,12,0,0" HorizontalAlignment="Left"
+                            Background="#5A6A8A" Foreground="White" BorderThickness="0" Padding="14,4" Cursor="Hand"/>
+                </StackPanel>
+            </Grid>
+        </TabItem>
     </TabControl>
     </DockPanel>
 </Window>

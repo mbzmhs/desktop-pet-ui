@@ -1,13 +1,23 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using System.Text.Json;
 using System.Windows.Media;
 using System.Windows.Threading;
 using DesktopPetUi.Core;
+using DesktopPetUi.Core.Plugin;
+using DesktopPetUi.Plugins;
+// WPF/WinForms 隐式 using 冲突消解（插件设置 Tab 动态控件用）
+using Brushes = System.Windows.Media.Brushes;
+using Color = System.Windows.Media.Color;
+using Control = System.Windows.Controls.Control;
+using CheckBox = System.Windows.Controls.CheckBox;
+using TextBox = System.Windows.Controls.TextBox;
 
 namespace DesktopPetUi;
 
@@ -23,6 +33,7 @@ public partial class SettingsWindow : Window
         InitializeComponent();
         ReloadList();
         LoadGlobal();
+        ReloadPlugins();
         _statusTimer.Tick += (_, _) => { _statusTimer.Stop(); StatusText.Text = ""; };
     }
 
@@ -562,4 +573,196 @@ ExtraParamsBox.Text = CurrentProviderExtra();
     }
 
     private void OnClose(object sender, RoutedEventArgs e) => Close();
+
+    // ---------------- 插件设置 Tab ----------------
+
+    /// <summary>插件列表行：勾选框=启用/禁用（热生效），标题随状态刷新。Key=dll 文件名（PluginManager.Find 的键）。</summary>
+    private sealed class PluginRow : INotifyPropertyChanged
+    {
+        public string Key { get; }
+        public LoadedPlugin Plugin { get; }
+        /// <summary>启用/禁用切换后触发（窗口据此重渲染右侧详情）。</summary>
+        public event Action<PluginRow>? StateChanged;
+
+        public PluginRow(LoadedPlugin p)
+        {
+            Plugin = p;
+            Key = Path.GetFileNameWithoutExtension(p.DllName);
+        }
+
+        private string BuildTitle()
+        {
+            var state = Plugin.Error.Length > 0 ? "加载失败" : (IsEnabled ? "已启用" : "已禁用");
+            return Plugin.DisplayName + (Plugin.Info != null ? " v" + Plugin.Info.Version : "") + "（" + state + "）";
+        }
+
+        public string Title { get; private set; } = "";
+
+        /// <summary>勾选框双向绑定：getter=真实状态（启用&&注册成功）；setter 切到 false=禁用，切到 true=重新注册
+        /// （失败则保持禁用并记错误，通知刷新使勾选项回弹）。</summary>
+        public bool IsEnabled
+        {
+            get => Plugin.Enabled && Plugin.Info != null;
+            set
+            {
+                if (value == IsEnabled) return;
+                PluginManager.SetEnabled(Key, value);
+                RefreshTitle();
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsEnabled)));
+                StateChanged?.Invoke(this);
+            }
+        }
+
+        public void RefreshTitle()
+        {
+            Title = BuildTitle();
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Title)));
+        }
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+    }
+
+    private void ReloadPlugins()
+    {
+        var selKey = (PluginList.SelectedItem as PluginRow)?.Key;
+        PluginList.Items.Clear();
+        foreach (var p in PluginManager.All)
+        {
+            var row = new PluginRow(p);
+            row.RefreshTitle();
+            row.StateChanged += OnPluginStateChanged;
+            PluginList.Items.Add(row);
+        }
+        if (PluginList.Items.Count == 0) return;
+        if (selKey != null)
+            PluginList.SelectedItem = PluginList.Items.OfType<PluginRow>()
+                .FirstOrDefault(x => string.Equals(x.Key, selKey, StringComparison.OrdinalIgnoreCase)) ?? PluginList.Items[0];
+    }
+
+    private void OnPluginSelected(object sender, SelectionChangedEventArgs e)
+    {
+        if (PluginList.SelectedItem is PluginRow row) RefreshPluginDetails(row);
+    }
+
+    /// <summary>列表勾选框切换启用/禁用后：若该行正被选中，重渲染右侧详情（设定区随禁用清空）。</summary>
+    private void OnPluginStateChanged(PluginRow row)
+    {
+        if (ReferenceEquals(PluginList.SelectedItem, row)) RefreshPluginDetails(row);
+    }
+
+    private void RefreshPluginDetails(PluginRow row)
+    {
+        var p = row.Plugin;
+        PluginTitle.Text = p.DisplayName + (p.Info != null ? "  v" + p.Info.Version : "");
+        PluginMeta.Text = p.Info != null ? "作者：" + p.Info.Author + "    文件：" + p.DllName : "文件：" + p.DllName;
+        PluginDesc.Text = p.Info?.Description ?? "";
+        if (p.Error.Length > 0)
+        {
+            PluginError.Text = "加载/注册失败：" + p.Error;
+            PluginError.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            PluginError.Visibility = Visibility.Collapsed;
+        }
+        RenderPluginSettings(row);
+    }
+
+    /// <summary>按插件 GetSettings 渲染设定控件（Tag=设定名，初始值取 SettingDef.Value）。</summary>
+    private void RenderPluginSettings(PluginRow row)
+    {
+        PluginSettingsPanel.Children.Clear();
+        var defs = PluginManager.GetSettings(row.Key);
+        if (defs.Count == 0)
+        {
+            PluginSettingsPanel.Children.Add(new TextBlock { Text = "该插件没有设定项", Foreground = Brushes.Gray, Margin = new Thickness(0, 4, 0, 0) });
+            return;
+        }
+        foreach (var def in defs)
+        {
+            var label = new TextBlock { Text = def.Description.Length > 0 ? def.Name + " — " + def.Description : def.Name, Foreground = Brushes.DimGray, Margin = new Thickness(0, 8, 0, 2), TextWrapping = TextWrapping.Wrap };
+            PluginSettingsPanel.Children.Add(label);
+
+            Control input;
+            switch (def.Type)
+            {
+                case SettingType.Bool:
+                    var chk = new CheckBox { IsChecked = def.Value is { ValueKind: JsonValueKind.True or JsonValueKind.False } v ? v.GetBoolean() : false, Foreground = Brushes.Black };
+                    input = chk;
+                    break;
+                case SettingType.Json:
+                    var tb = new TextBox
+                    {
+                        Text = def.Value?.GetRawText() ?? "",
+                        AcceptsReturn = true,
+                        TextWrapping = TextWrapping.Wrap,
+                        MinHeight = 72,
+                        VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                        Background = Brushes.White,
+                        Foreground = Brushes.Black,
+                        BorderBrush = new SolidColorBrush(Color.FromRgb(0xC8, 0xC8, 0xC8)),
+                    };
+                    input = tb;
+                    break;
+                default: // String / Int / Double
+                    var val = def.Value;
+                    var txt = new TextBox
+                    {
+                        Text = val switch
+                        {
+                            null or { ValueKind: JsonValueKind.Null } => "",
+                            { ValueKind: JsonValueKind.String } s => s.GetString() ?? "",
+                            _ => val!.Value.GetRawText(), // GetRawText 是扩展方法，Nullable 不提升，显式 .Value
+                        },
+                        Background = Brushes.White,
+                        Foreground = Brushes.Black,
+                        BorderBrush = new SolidColorBrush(Color.FromRgb(0xC8, 0xC8, 0xC8)),
+                    };
+                    input = txt;
+                    break;
+            }
+            input.Tag = def.Name;
+            PluginSettingsPanel.Children.Add(input);
+        }
+    }
+
+    private void OnPluginSettingsSave(object sender, RoutedEventArgs e)
+    {
+        if (PluginList.SelectedItem is not PluginRow item) return;
+        var errors = new List<string>();
+        foreach (var child in PluginSettingsPanel.Children.OfType<Control>().Where(c => c.Tag is string))
+        {
+            var name = (string)child.Tag!;
+            JsonElement value;
+            if (child is CheckBox chk)
+                value = chk.IsChecked == true ? JsonDocument.Parse("true").RootElement.Clone() : JsonDocument.Parse("false").RootElement.Clone();
+            else
+            {
+                var text = ((TextBox)child).Text.Trim();
+                try
+                {
+                    // 文本框内容按 JSON 值解析（字符串需带引号时由插件 GetSettings 的 Value 回显格式决定；裸文本按字符串处理）
+                    value = text.Length > 0 && (text[0] is '{' or '[' or '"' || char.IsDigit(text[0]) || text.StartsWith("-"))
+                        ? JsonDocument.Parse(text).RootElement.Clone()
+                        : JsonSerializer.SerializeToElement(text);
+                }
+                catch (JsonException)
+                {
+                    errors.Add(name + "：不是合法的 JSON 值");
+                    continue;
+                }
+            }
+
+            var r = PluginManager.UpdateSetting(item.Key, name, value);
+            if (!r.Ok) errors.Add(name + "：" + r.Error);
+        }
+
+        if (errors.Count > 0)
+        {
+            ShowStatus("保存失败：" + string.Join("；", errors), ok: false);
+            return;
+        }
+        ShowStatus("插件设定已保存");
+        RenderPluginSettings(item); // 回显新值（插件应已在 UpdateSetting 中更新自身状态）
+    }
 }

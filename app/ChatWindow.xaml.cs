@@ -313,22 +313,23 @@ public partial class ChatWindow : Window
         // 历史消息 + agent 操作记录，按时间戳合并排序（工具往返也进历史了：协议消息渲染成紧凑行，不占气泡）
         var history = _pipeline.History; // 加锁快照
         var firstTs = history.Count > 0 ? history.Min(m => m.Timestamp) : DateTime.MaxValue;
-        var items = new List<(DateTime Ts, FrameworkElement El)>();
+        var items = new List<(DateTime Ts, FrameworkElement El, string Kind)>();
         foreach (var m in history)
         {
             var isUser = m.Role == "user";
             // 缓存键含展开态：[result]/[error] 折叠/切换展开时重建为不同元素
             var key = (isUser ? "u" : "a") + "\u0001" + m.Timestamp.Ticks + "\u0001" + m.Content
                       + (_expanded.Contains(m.Content) ? "\u0002e" : "");
+            var proto = IsProtocolMessage(m);
             FrameworkElement el;
             if (!_msgElCache.TryGetValue(key, out el))
             {
-                el = IsProtocolMessage(m)
+                el = proto
                     ? BuildExchangeLine(m)
                     : BuildBubble(isUser, isUser ? "你" : name, m.Timestamp, ToDisplay(m.Content));
                 _msgElCache[key] = el;
             }
-            items.Add((m.Timestamp, el));
+            items.Add((m.Timestamp, el, isUser ? (proto ? "protoU" : "user") : (proto ? "toolA" : "asst")));
         }
         // 早于第一条聊天记录的 agent 操作不进窗（清空记录后不残留一排孤行）；数据仍在 agent_ops.json，记忆管理器可见可清
         foreach (var op in _ops.Where(o => o.Ts >= firstTs))
@@ -339,7 +340,7 @@ public partial class ChatWindow : Window
                 el = BuildOpLine(op);
                 _msgElCache[key] = el;
             }
-            items.Add((op.Ts, el));
+            items.Add((op.Ts, el, "op:" + op.Verdict));
         }
         // 冻结气泡（[tool] 抑制/出错）：按冻结时刻参与排序，停在它本该在的位置（自动放行记录之前），
         // 而不是临时挂到面板末尾；正式版 assistant 消息落历史后（Timestamp ≥ 冻结时刻）移除临时版
@@ -347,33 +348,39 @@ public partial class ChatWindow : Window
         {
             var replaced = history.Any(m => m.Role == "assistant" && m.Timestamp >= _frozenTs.AddSeconds(-1));
             if (replaced) RemoveStreamBubble();
-            else items.Add((_frozenTs, _streamBubble!));
+            else items.Add((_frozenTs, _streamBubble!, "FROZEN"));
         }
         // 稳定排序：时间戳相同（同一毫秒的工具往返）保持插入顺序
-        var ordered = items.Select((it, i) => new { it.El, Ts = it.Ts, I = i })
+        var ordered = items.Select((it, i) => new { it.El, Ts = it.Ts, Kind = it.Kind, I = i })
                            .OrderBy(x => x.Ts).ThenBy(x => x.I)
                            .ToList();
+        // 布局诊断：流式/冻结气泡在场时记录面板实际顺序（时间戳+类型），排查"工具记录跑到文本上方"类问题
+        if (_streamFrozen || _streamFilter != null)
+            Log.Info("[layout] " + string.Join(" | ", ordered.Select(o => o.Ts.ToString("HH:mm:ss.fff") + ":" + o.Kind))
+                     + (_streamBubble != null && !_streamFrozen ? " | typing@tail" : ""));
         foreach (var o in ordered) MsgPanel.Children.Add(o.El);
 
         if (_pendingConfirm != null && !_pendingConfirm.Resolved)
             MsgPanel.Children.Add(_pendingConfirm.Card); // 未决确认卡片保持在消息流末尾
         if (_pendingAsk != null && !_pendingAsk.Resolved)
             MsgPanel.Children.Add(_pendingAsk.Card);     // 未决提问卡片同理
-        // 流式打字气泡=最新内容，保持在最末尾（Clear 后重挂）；冻结气泡在上面已按时间戳入 items 排好位
-        if (_streamFilter != null && _streamBubble?.Parent == null)
-            MsgPanel.Children.Add(_streamBubble!);
+        // 流式打字气泡=最新内容，保持在最末尾（Clear 后重挂）；冻结气泡在上面已按时间戳入 items 排好位。
+        // 必须显式判 _streamBubble != null：?.Parent 在 null 时也是 null==null=true，会把 null Add 进面板崩掉。
+        // 已被取代判定（后台时钟同域比较）：本步流起点后已有 assistant 消息落历史（工具步原文/正式版），
+        // 临时气泡内容已有正式载体 → 不重挂，消除"打字气泡与正式版同屏双显"的瞬态重叠
+        var startTs = _pipeline.StreamStepStartTs;
+        var superseded = startTs != null && history.Any(m => m.Role == "assistant" && m.Timestamp >= startTs.Value.AddSeconds(-1));
+        if (_streamBubble != null && _streamBubble.Parent == null && !superseded)
+            MsgPanel.Children.Add(_streamBubble);
         if (scrollToEnd) ScrollToEnd();
     }
 
-    /// <summary>剥离情绪标签（内置 + TTS 自定义），避免 [happy] 之类出现在显示文本里。</summary>
+    /// <summary>剥离情绪标签（内置 ∪ 角色文件夹 ∪ TTS 自定义，与流式过滤同口径），避免 [happy] 之类出现在显示文本里。</summary>
     private string ToDisplay(string? content)
     {
         var s = content ?? "";
         if (s.Length == 0) return "";
-        var tags = new List<string>(ChatEmotion.Emotions);
-        if (_pipeline.AvailableEmotions != null)
-            foreach (var t in _pipeline.AvailableEmotions)
-                if (!tags.Any(x => x.Equals(t, StringComparison.OrdinalIgnoreCase))) tags.Add(t);
+        var tags = _pipeline.AllKnownEmotions();
         if (tags.Count == 0) return s;
         var rx = new Regex(@"\[(?:" + string.Join("|", tags.Select(Regex.Escape)) + @")\]", RegexOptions.Compiled);
         s = rx.Replace(s, " ");
@@ -433,7 +440,7 @@ public partial class ChatWindow : Window
             {
                 if (_streamFrozen) RemoveStreamBubble();
                 _streamFrozen = false;
-                _streamFilter = new StreamTagFilter(_pipeline.AvailableEmotions);
+                _streamFilter = new StreamTagFilter(_pipeline.AllKnownEmotions()); // 内置∪角色文件夹∪TTS：TTS 不可用时标签也不漏进显示
                 _streamRaw = "";
                 _streamShown = "";
             }
@@ -464,14 +471,19 @@ public partial class ChatWindow : Window
             else if (_streamText != null)
             {
                 var shown = ToDisplay(_streamShown).Trim();
-                if (shown.Length == 0) { RemoveStreamBubble(); return; } // 纯工具块调用（整条回复无正文）：不留空气泡
-                _streamFrozen = true;
-                _frozenTs = DateTime.Now; // 重建时按此时刻排序（早于同一步的自动放行记录）
-                // 正文已完整（[tool] 块已被过滤器吞掉，块两侧正文都在）：去光标冻结纯文本 + 头注改 名字+时间戳。
-                // 不做 MarkdownRenderer 整树替换（会闪）；Markdown 正式版由工具执行完 OnMessage 落历史的重建自然换入
-                _streamText.Text = shown;
-                var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
-                if (_streamHeader != null) _streamHeader.Text = name + "  " + _frozenTs.ToString("MM-dd HH:mm");
+                if (shown.Length == 0) { RemoveStreamBubble(); } // 纯工具块调用（整条回复无正文）：不留空气泡；不能 return——要走到下面清 _streamFilter，否则残留过滤器会让下次重建往面板里 Add(null) 崩掉
+                else
+                {
+                    _streamFrozen = true;
+                    // 用管线记录的后台时钟时刻（与历史 Timestamp 同时钟域）：UI 线程卡顿导致 UI Now 落后 >1s 时，
+                    // 旧逻辑会把"正式版已落历史"误判为否 → 冻结纯文本气泡与正式版 Markdown 气泡同屏重叠闪烁
+                    _frozenTs = _pipeline.LastToolStepEndTs ?? DateTime.Now;
+                    // 正文已完整（[tool] 块已被过滤器吞掉，块两侧正文都在）：去光标冻结纯文本 + 头注改 名字+时间戳。
+                    // 不做 MarkdownRenderer 整树替换（会闪）；Markdown 正式版由工具执行完 OnMessage 落历史的重建自然换入
+                    _streamText.Text = shown;
+                    var name = string.IsNullOrEmpty(App.Config.EffectiveCharacterName) ? "宠物" : App.Config.EffectiveCharacterName;
+                    if (_streamHeader != null) _streamHeader.Text = name + "  " + _frozenTs.ToString("MM-dd HH:mm");
+                }
             }
             _streamFilter = null;
             _streamRaw = "";

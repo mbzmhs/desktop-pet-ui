@@ -10,7 +10,9 @@ using System.Windows.Interop;
 using System.Windows.Threading;
 using DesktopPetUi.Core;
 using DesktopPetUi.Core.Agent;
+using DesktopPetUi.Core.Plugin;
 using DesktopPetUi.Native;
+using DesktopPetUi.Plugins;
 
 namespace DesktopPetUi;
 
@@ -114,6 +116,10 @@ public partial class App : System.Windows.Application
                 });
                 SetupHotkey();
             }
+
+            // 插件系统：扫描 plugins/*.dll 并注册（设定/启用状态在 exe 目录 plugin.json）；
+            // 能力桥=代替用户发消息（走完整聊天管线）+ 获取 Pet 信息。加载失败不影响主体启动
+            PluginManager.LoadAll(Path.Combine(AppContext.BaseDirectory, "plugins"), new AppPluginBridge(this));
 
             _window.Show();
             Log.Info("Window shown");
@@ -532,6 +538,7 @@ public partial class App : System.Windows.Application
         try { _window?.ShutdownSafely(); } catch { }
         try { _hotkey?.Dispose(); } catch { }
         try { _chatPipeline?.Dispose(); } catch { }
+        try { PluginManager.ShutdownAll(); } catch { }
         if (_tray != null)
         {
             _tray.Visible = false;
@@ -539,5 +546,25 @@ public partial class App : System.Windows.Application
         }
         _mutex?.Dispose();
         base.OnExit(e);
+    }
+
+    /// <summary>插件宿主能力桥：SendChatAsync 走完整聊天管线（与用户消息同路径，_gate 自然排队）；GetPetInfo 读 PetWindow。</summary>
+    private sealed class AppPluginBridge(App app) : IPluginHostBridge
+    {
+        public Task<bool> SendChatAsync(string text, CancellationToken ct)
+        {
+            if (app._chatPipeline == null || App.PetWindow == null) return Task.FromResult(false);
+            try
+            {
+                return app._chatPipeline.RunAsync(text, App.PetWindow!);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("plugins: SendChatAsync 失败", ex);
+                return Task.FromResult(false);
+            }
+        }
+
+        public PetSnapshot GetPetInfo() => App.PetWindow?.GetSnapshot() ?? new PetSnapshot();
     }
 }

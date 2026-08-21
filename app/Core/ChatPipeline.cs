@@ -7,6 +7,8 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using DesktopPetUi.Core.Agent;
+using DesktopPetUi.Core.Plugin;
+using DesktopPetUi.Plugins;
 
 namespace DesktopPetUi.Core;
 
@@ -132,6 +134,46 @@ public sealed class ChatPipeline : IDisposable
     /// <summary>TTS 端可用自定义情感（显示层剥离情绪标签用）；null=尚未获取。</summary>
     public HashSet<string>? AvailableEmotions => _availableEmotions;
 
+    // ---------------- 情绪标签词表（显示剥离口径） ----------------
+    private string _knownEmoChar = "";
+    private HashSet<string> _allKnownEmotions = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _knownEmoAt;
+
+    /// <summary>全部已知情绪标签 = 内置 ∪ 当前角色文件夹情感 ∪ TTS 端列表。
+    /// 显示层（流式过滤/气泡剥离）一律用此口径：模型被提示词引导使用角色文件夹名，若只认 TTS 端列表，
+    /// TTS 不可用或未注册该情感时标签会漏进显示文本（"表情标签不解析"）。30s 缓存兜住文件夹增删。</summary>
+    public HashSet<string> AllKnownEmotions()
+    {
+        var cur = _config.Character.Current ?? "";
+        if (cur != _knownEmoChar || (DateTime.UtcNow - _knownEmoAt).TotalSeconds > 30)
+        {
+            _knownEmoChar = cur;
+            _knownEmoAt = DateTime.UtcNow;
+            var set = new HashSet<string>(ChatEmotion.Emotions, StringComparer.OrdinalIgnoreCase);
+            foreach (var e in CharacterEmotions() ?? Array.Empty<string>()) set.Add(e);
+            if (_availableEmotions != null) foreach (var e in _availableEmotions) set.Add(e);
+            _allKnownEmotions = set;
+        }
+        return _allKnownEmotions;
+    }
+
+    // ---------------- 工具步流结束时刻（后台时钟） ----------------
+    private DateTime? _lastToolStepEndTs;
+    private bool _agentStreamFirstDelta = true;
+
+    /// <summary>最近一次 agent 工具步流式结束的后台线程时刻（与历史消息 Timestamp 同时钟域）。
+    /// ChatWindow 冻结打字气泡时用它做"正式版已落历史"判定——UI 时钟与后台时钟跨域比较会因 UI 卡顿误判，
+    /// 导致冻结纯文本气泡与正式版 Markdown 气泡同屏重叠闪烁。null=本流尚未结束过工具步。</summary>
+    public DateTime? LastToolStepEndTs => _lastToolStepEndTs;
+
+    // ---------------- 当前流起点（后台时钟） ----------------
+    private DateTime? _streamStepStartTs;
+
+    /// <summary>当前这条流（agent 步 / 普通回复 / 主动搭话）首个增量的后台线程时刻。
+    /// ChatWindow 用它判定"临时打字气泡是否已被正式版取代"：历史里出现 ≥ 该时刻的 assistant 消息
+    /// （工具步原文 aMsg / 最终正式版）即说明内容已有正式载体，不再重挂临时气泡，避免同内容双显。</summary>
+    public DateTime? StreamStepStartTs => _streamStepStartTs;
+
     public ChatPipeline(AppConfig config)
     {
         _config = config;
@@ -153,8 +195,17 @@ public sealed class ChatPipeline : IDisposable
         _agent.OnUsage = (pt, sc) => OnUsageSample(pt, sc);
         // agent 各步流式增量 → 聊天窗打字气泡。[tool] 块由 StreamTagFilter 按区间吞掉（工具可在头部/中部/尾部，
         // 块两侧的正文照常放行显示）；这里只记录"本步含工具"，供流结束时决定 End(false) 还是 End(true)
+        // 插件消息链：agent 各步与最终回复在流式结束以后、[tool] 解析之前逐插件传递（异常隔离）
+        _agent.PreprocessReply = (reply, isAgentStep) =>
+            PluginManager.RunReplyChain(reply, new ReplyContext { Source = isAgentStep ? "agent-step" : "final", IsAgentStep = isAgentStep });
         _agent.OnStreamDelta = soFar =>
         {
+            if (_agentStreamFirstDelta)
+            {
+                _agentStreamFirstDelta = false;
+                _lastToolStepEndTs = null; // 新流开始：上一工具步的结束时刻作废（防出错停止时误读旧值）
+                _streamStepStartTs = DateTime.Now; // 本步流起点（后台时钟）：打字气泡"已被取代"判定用
+            }
             if (!_agentStreamSuppressed && soFar.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
                 _agentStreamSuppressed = true; // 本步是中间工具步（最终纯文字回答不含 [tool]，情绪标签不受影响）
             ReplyDelta?.Invoke(soFar);
@@ -163,6 +214,8 @@ public sealed class ChatPipeline : IDisposable
         {
             var toolStep = _agentStreamSuppressed;
             _agentStreamSuppressed = false; // 本步流结束：复位给下一步的新流
+            if (toolStep) _lastToolStepEndTs = DateTime.Now; // 后台时钟：与 aMsg.Timestamp 同时钟域，冻结气泡归位判定用
+            _agentStreamFirstDelta = true;
             ReplyStreamEnd?.Invoke(completed && !toolStep); // 正常完成且非工具步=true（移除气泡）；工具步/出错=false（冻结收尾）
         };
         _agent.TokPerCharProvider = () => TokPerChar; // 硬护栏裁剪用同一校准比率
@@ -225,7 +278,7 @@ public sealed class ChatPipeline : IDisposable
         {
             var pathLine = AgentPathsLine(_config);
             if (!string.IsNullOrWhiteSpace(pathLine)) parts.Add(pathLine);
-            parts.Add(AgentToolLine());
+            parts.Add(AgentToolLine(PluginManager.PromptToolLines())); // 插件工具随活动列表现取（禁用即不再注入）
         }
         else
         {
@@ -247,8 +300,9 @@ public sealed class ChatPipeline : IDisposable
         return string.Join("\n\n", parts);
     }
 
-    /// <summary>Agent 工具协议（仅 agent 开启时注入）。英文书写以最大化指令遵循；回复语言由 LANGUAGE 段控制。</summary>
-    private static string AgentToolLine()
+    /// <summary>Agent 工具协议（仅 agent 开启时注入）。英文书写以最大化指令遵循；回复语言由 LANGUAGE 段控制。
+    /// pluginTools=活动插件的工具描述行（"" = 无插件工具）。</summary>
+    private static string AgentToolLine(string pluginTools)
     {
         return "[AGENT MODE] You can operate this computer on the user's behalf via tools. " +
                "CURRENT STATE: agent mode is ENABLED right now — if any earlier message says tools/the Agent are disabled or unavailable, that is stale (the setting was off at the time); ignore it and call tools normally.\n" +
@@ -275,6 +329,7 @@ public sealed class ChatPipeline : IDisposable
                 "- check_job(job_id): check a background job's progress and output\n" +
                 "- todo(action, text?, id?): manage the user-visible task list (shown in a dedicated window). action=add(text=...) to create items, done/undone(id=...), remove(id=...), clear, list. For any non-trivial multi-step task: FIRST add the planned steps, then mark each done IMMEDIATELY as you finish it — the user watches progress live. Items must be concrete, independently completable steps (e.g. \"find file X\", \"write a.txt\") — NEVER create an umbrella/summary item like \"finish the whole task\"; never leave an item unmarked after its step is actually done.\n" +
                "- observe_screen(): capture screenshots of the user's screens and view them. When the user asks what is on their screen / what they are looking at, ALWAYS call this FIRST and answer based only on what you actually see in the images.\n" +
+               (pluginTools.Length > 0 ? pluginTools + "\n" : "") + // 插件工具（活动插件，禁用即不再注入）
                "HARD RULES:\n" +
                "- To create an empty DIRECTORY, use run_powershell with `New-Item -ItemType Directory` (or mkdir); NEVER use write_file for directories.\n" +
                "- NEVER invent file paths. Before write_file/edit_file/delete_file/search_content, verify the path exists with list_dir or search_files.\n" +
@@ -454,6 +509,7 @@ public sealed class ChatPipeline : IDisposable
                 if (rawReply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
                     rawReply = AgentRunner.StripToolBlocks(rawReply); // 仍不合规：剥离工具块只留文字部分
             }
+            rawReply = PluginManager.RunReplyChain(rawReply, new ReplyContext { Source = "final", IsAgentStep = false }); // 插件消息链（最终回答）
             lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             NotifyHistory();
 
@@ -507,6 +563,7 @@ public sealed class ChatPipeline : IDisposable
                 messages[^1] = new ChatMessage { Role = "user", Content = messages[^1].Content + "\n" + ProactiveRepeatInstruction() };
                 rawReply = await CompleteAsync(messages, _config.EffectiveProactiveTemperature, cts.Token, onDelta: _ => { });
             }
+            rawReply = PluginManager.RunReplyChain(rawReply, new ReplyContext { Source = "proactive", IsAgentStep = false }); // 插件消息链（主动搭话）
             _lastProactive = rawReply;
 
             var (specs, fullText) = await PlanSegmentsAsync(rawReply);
@@ -599,6 +656,7 @@ public sealed class ChatPipeline : IDisposable
         if (onDelta != null && _config.Chat.StreamEnabled)
         {
             var streamOk = false;
+            var firstDelta = true;
             try
             {
                 result = await LlamaClient.CompleteStreamAsync(
@@ -607,7 +665,7 @@ public sealed class ChatPipeline : IDisposable
                     ep.Model,
                     temperatureOverride ?? _config.EffectiveTemperature,
                     _config.EffectiveMaxTokens,
-                    soFar => { onDelta(soFar); ReplyDelta?.Invoke(soFar); },
+                    soFar => { if (firstDelta) { firstDelta = false; _streamStepStartTs = DateTime.Now; } onDelta(soFar); ReplyDelta?.Invoke(soFar); },
                     ep.ApiKey,
                     ep.ExtraParams,
                     ct);

@@ -11,6 +11,7 @@ using System.Security;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using DesktopPetUi.Core.Plugin;
 
 namespace DesktopPetUi.Core.Agent;
 
@@ -188,7 +189,7 @@ public static class AgentTools
         "edit_file" or "delete_file" or "search_content" or "web_fetch" or
         "run_powershell" or "start_powershell" or "check_job" or "ask_user" or
         "observe_screen" or "todo" => true,
-        _ => false,
+        _ => PluginManager.IsPluginTool(name), // 活动插件提供的工具同样合法（禁用后自动失效）
     };
 
     public static ParsedToolCall? Build(string name, JsonObject args, AppConfig cfg)

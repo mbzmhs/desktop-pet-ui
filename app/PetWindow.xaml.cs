@@ -15,6 +15,7 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using DesktopPetUi.Core;
 using DesktopPetUi.Native;
+using DesktopPetUi.Plugins;
 
 namespace DesktopPetUi;
 
@@ -307,10 +308,13 @@ public partial class PetWindow : Window, ISpeakHost
         }
     }
 
+    private string _lastEmotion = ""; // 插件 GetPetInfo：当前应用的情绪标签
+
     public void ApplyEmotion(string? emotion)
     {
         var name = string.IsNullOrWhiteSpace(emotion) ? _config.Character.IdleEmotion : emotion;
         name = string.Concat(name.Where(c => !Path.GetInvalidFileNameChars().Contains(c)));
+        _lastEmotion = name;
         var path = ResolveImagePath(name);
         if (path != null && path == _currentImagePath) return;
         _currentImagePath = path;
@@ -625,6 +629,20 @@ public partial class PetWindow : Window, ISpeakHost
         _previewScale = null;
         EndSpeechVisuals();
     }
+
+    /// <summary>插件系统：当前 Pet 状态快照（角色/情绪/缩放/窗口位置/功能开关）。</summary>
+    public PetSnapshot GetSnapshot() => new()
+    {
+        Character = _config.Character.Current,
+        Emotion = _lastEmotion,
+        Scale = _config.Character.Scale,
+        WindowLeft = (int)Left,
+        WindowTop = (int)Top,
+        WindowWidth = (int)Width,
+        WindowHeight = (int)Height,
+        ChatEnabled = _config.Chat.Enabled,
+        AgentEnabled = _config.Chat.Agent.Enabled,
+    };
 
     // ---------------- click-through ----------------
 

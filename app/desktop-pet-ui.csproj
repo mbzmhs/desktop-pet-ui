@@ -22,6 +22,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\plugin-api\DesktopPetUi.PluginApi.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Include="..\character\**" CopyToOutputDirectory="PreserveNewest" LinkBase="character" ExcludeFromSingleFile="true" />
   </ItemGroup>
 

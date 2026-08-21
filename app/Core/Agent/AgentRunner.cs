@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Text.Json.Nodes;
+using DesktopPetUi.Core.Plugin;
 
 namespace DesktopPetUi.Core.Agent;
 
@@ -29,12 +30,15 @@ public sealed class AgentRunner
     /// <summary>token/字 比率提供器（管线注入）：硬护栏裁剪用；null=未校准时默认 ~1.5 字/token。</summary>
     public Func<double>? TokPerCharProvider { get; set; }
 
-    /// <summary>流式增量回调（参数=该步到目前为止的累计全文；仅展示层用）。管线注入时会做 [tool] 门控：
-    /// 一旦出现 [tool] 说明是中间工具步，停止转发并收尾打字气泡，避免把工具 JSON 闪现出来。</summary>
+    /// <summary>流式增量回调（参数=该步到目前为止的累计全文；仅展示层用）。[tool] 块由 StreamTagFilter 按区间吞掉，
+    /// 管线只记录"本步含工具"供流结束时收尾打字气泡。</summary>
     public Action<string>? OnStreamDelta { get; set; }
 
     /// <summary>该步流式传输结束（均触发一次；与 OnStreamDelta 配对）。参数=是否正常生成完毕（false=出错/停止）。</summary>
     public Action<bool>? OnStreamEnd { get; set; }
+
+    /// <summary>插件消息链钩子（管线注入）：(回复全文, 是否agent中间步) → 处理后文本。流式结束以后、[tool] 解析之前调用。</summary>
+    public Func<string, bool, string>? PreprocessReply { get; set; }
 
     public AgentRunner(AppConfig config) => _config = config;
 
@@ -90,7 +94,17 @@ public sealed class AgentRunner
 
             string? feedback = null; // 非 null 时回填给模型继续循环
             List<string>? feedbackImages = null; // 工具结果携带的截图（随反馈消息发给视觉模型）
+            if (PreprocessReply != null) reply = PreprocessReply(reply, true); // 插件消息链：流式结束以后、[tool] 解析之前
             var block = FindToolBlock(reply);
+            var hasTool = block != null || reply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (hasTool)
+            {
+                // 先把本步原文落历史（含 [tool] 块）：UI 按时间戳排序时正文气泡+⚙行先于裁定记录出现。
+                // 此前 aMsg 在 OnOp 之后才落库，裁定徽标会排在冻结正文上方 → "工具记录跑到文本气泡上方"
+                var aMsg = new ChatMessage { Role = "assistant", Content = reply, Timestamp = replyAt };
+                messages.Add(aMsg);
+                OnMessage?.Invoke(aMsg); // 中间往返进长期历史：模型跨对话保留工具用法与操作记忆（opencode 式）
+            }
             if (block is { } b)
             {
                 var jsonText = reply[b.Start..b.End];
@@ -105,66 +119,88 @@ public sealed class AgentRunner
                     Log.Info($"Agent step {step}/{stepsDisplay}: {call.Name} raw={EscapeForLog(jsonText)}");
                     DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 工具调用: " + call.Name + "  " + call.Description.Replace("\n", " ⏎ "));
 
-                    var (tier, autoReason) = AgentTools.Classify(call, _config);
-                    if (tier == ToolTier.Auto && call.Risk == "high" && !AgentTools.TargetInTrustedDir(call, _config))
-                        tier = ToolTier.Confirm; // 模型自评高风险 → 升级为确认（宿主分级仍是底线；信任目录豁免——用户已显式授权其下文件操作）
-                    string? trustNote = null;
-                    if (tier == ToolTier.Confirm)
+                    // 插件工具：直接执行（不走权限分级/确认，插件作者自负行为），审计 verdict=plugin；内置工具走下面的分级流程
+                    var plugin = PluginManager.FindToolHandler(call.Name);
+                    if (plugin != null)
                     {
-                        var question = call.Description
-                            + (call.Risk.Length > 0 ? "\n（模型自评：" + call.Risk
-                                + (call.RiskNote.Length > 0 ? "，" + Truncate(call.RiskNote, 60) : "") + "）" : "");
-                        DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 需要用户确认: " + question.Replace("\n", " ⏎ "));
-                        var trustDir = AgentTools.TrustableDirFor(call, _config);
-                        // 标题 = reason（目的）· Title（动作），两者都要：reason 可能描述不全；只有一方时显示存在的一方
-                        var confirmTitle = string.IsNullOrWhiteSpace(call.Reason) ? call.Title
-                            : string.IsNullOrWhiteSpace(call.Title) ? call.Reason
-                                : call.Reason + " · " + call.Title;
-                        var res = await host.ConfirmAsync(new ConfirmRequest
+                        OnOp?.Invoke(new AgentOpRecord
                         {
-                            Title = confirmTitle,
-                            Detail = call.Detail,
-                            Risk = call.Risk,
-                            RiskNote = call.RiskNote,
-                            Question = question,
-                            TrustableDir = trustDir,
+                            Tool = call.Name,
+                            Title = call.Title,
+                            Reason = call.Reason,
+                            Detail = call.Description,
+                            Verdict = "plugin",
+                            Note = "plugin: " + plugin.DisplayName,
                         });
-                        if (!res.Allowed)
-                            feedback = DeclineResult(call.Name);
-                        else if (res.TrustFolder && trustDir != null)
-                            trustNote = "用户已授权目录「" + trustDir + "」：其下文件操作直接放行，字面路径全部位于该目录的 PowerShell 命令也无需再问（无路径/含变量的命令仍会确认）。";
+                        ct.ThrowIfCancellationRequested(); // 用户点了停止 → 不执行工具
+                        var result = await PluginManager.ExecutePluginToolAsync(plugin, call.Name, call.Args, call.Reason, ct);
+                        Log.Info("Agent plugin tool [" + call.Name + "]: " + EscapeForLog(Truncate(result, 500)));
+                        DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 插件工具结果: " + Truncate(result, 500).Replace("\n", " ⏎ "));
+                        feedback = "[result] " + Truncate(result, 2000);
                     }
+                    else
+                    {
+                        var (tier, autoReason) = AgentTools.Classify(call, _config);
+                        if (tier == ToolTier.Auto && call.Risk == "high" && !AgentTools.TargetInTrustedDir(call, _config))
+                            tier = ToolTier.Confirm; // 模型自评高风险 → 升级为确认（宿主分级仍是底线；信任目录豁免——用户已显式授权其下文件操作）
+                        string? trustNote = null;
+                        if (tier == ToolTier.Confirm)
+                        {
+                            var question = call.Description
+                                + (call.Risk.Length > 0 ? "\n（模型自评：" + call.Risk
+                                    + (call.RiskNote.Length > 0 ? "，" + Truncate(call.RiskNote, 60) : "") + "）" : "");
+                            DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 需要用户确认: " + question.Replace("\n", " ⏎ "));
+                            var trustDir = AgentTools.TrustableDirFor(call, _config);
+                            // 标题 = reason（目的）· Title（动作），两者都要：reason 可能描述不全；只有一方时显示存在的一方
+                            var confirmTitle = string.IsNullOrWhiteSpace(call.Reason) ? call.Title
+                                : string.IsNullOrWhiteSpace(call.Title) ? call.Reason
+                                    : call.Reason + " · " + call.Title;
+                            var res = await host.ConfirmAsync(new ConfirmRequest
+                            {
+                                Title = confirmTitle,
+                                Detail = call.Detail,
+                                Risk = call.Risk,
+                                RiskNote = call.RiskNote,
+                                Question = question,
+                                TrustableDir = trustDir,
+                            });
+                            if (!res.Allowed)
+                                feedback = DeclineResult(call.Name);
+                            else if (res.TrustFolder && trustDir != null)
+                                trustNote = "用户已授权目录「" + trustDir + "」：其下文件操作直接放行，字面路径全部位于该目录的 PowerShell 命令也无需再问（无路径/含变量的命令仍会确认）。";
+                        }
 
-                    // 审计记录：每次工具调用的裁定都持久化（自动放行 / 用户允许 / 用户拒绝）；auto 备注=真实放行原因
-                    var verdict = feedback != null ? "denied" : (tier == ToolTier.Auto ? "auto" : "allowed");
-                    var opNote = verdict switch
-                    {
-                        "auto" => autoReason,
-                        "allowed" => trustNote != null ? "并信任该目录" : "",
-                        _ => "",
-                    };
-                    OnOp?.Invoke(new AgentOpRecord
-                    {
-                        Tool = call.Name,
-                        Title = call.Title,
-                        Reason = call.Reason,
-                        Detail = call.Detail,
-                        Verdict = verdict,
-                        Note = opNote,
-                    });
+                        // 审计记录：每次工具调用的裁定都持久化（自动放行 / 用户允许 / 用户拒绝）；auto 备注=真实放行原因
+                        var verdict = feedback != null ? "denied" : (tier == ToolTier.Auto ? "auto" : "allowed");
+                        var opNote = verdict switch
+                        {
+                            "auto" => autoReason,
+                            "allowed" => trustNote != null ? "并信任该目录" : "",
+                            _ => "",
+                        };
+                        OnOp?.Invoke(new AgentOpRecord
+                        {
+                            Tool = call.Name,
+                            Title = call.Title,
+                            Reason = call.Reason,
+                            Detail = call.Detail,
+                            Verdict = verdict,
+                            Note = opNote,
+                        });
 
-                    if (feedback == null)
-                    {
-                        ct.ThrowIfCancellationRequested(); // 等确认期间用户点了停止 → 不执行工具
-                        var result = await AgentTools.ExecuteAsync(call.Name, call.Args, _config, host, call.Reason, ct);
-                        Log.Info("Agent result [" + call.Name + "]: " + EscapeForLog(Truncate(result.Text, 500)));
-                        DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 工具结果: " + Truncate(result.Text, 500).Replace("\n", " ⏎ "));
-                        feedback = (trustNote != null ? "[note] " + trustNote + "\n" : "") + "[result] " + Truncate(result.Text, 2000);
-                        feedbackImages = result.Images;
+                        if (feedback == null)
+                        {
+                            ct.ThrowIfCancellationRequested(); // 等确认期间用户点了停止 → 不执行工具
+                            var result = await AgentTools.ExecuteAsync(call.Name, call.Args, _config, host, call.Reason, ct);
+                            Log.Info("Agent result [" + call.Name + "]: " + EscapeForLog(Truncate(result.Text, 500)));
+                            DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 工具结果: " + Truncate(result.Text, 500).Replace("\n", " ⏎ "));
+                            feedback = (trustNote != null ? "[note] " + trustNote + "\n" : "") + "[result] " + Truncate(result.Text, 2000);
+                            feedbackImages = result.Images;
+                        }
                     }
                 }
             }
-            else if (reply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
+            else if (hasTool) // block==null 且含 [tool] = 块不完整
             {
                 Log.Info("Agent 工具块不完整: " + EscapeForLog(Truncate(reply, 800)));
                 feedback = "[error] 工具调用块不完整（缺少 [tool]{...} 或大括号未闭合）。请重新完整输出：" + SingleLineFormat;
@@ -174,9 +210,6 @@ public sealed class AgentRunner
                 return reply; // 最终回答（情感标签由管线后续解析）
             }
 
-            var aMsg = new ChatMessage { Role = "assistant", Content = reply, Timestamp = replyAt };
-            messages.Add(aMsg);
-            OnMessage?.Invoke(aMsg); // 中间往返进长期历史：模型跨对话保留工具用法与操作记忆（opencode 式）
             var fbMsg = new ChatMessage { Role = "user", Content = feedback };
             if (feedbackImages != null) fbMsg.ImageBase64s = feedbackImages;
             messages.Add(fbMsg);
@@ -186,8 +219,9 @@ public sealed class AgentRunner
         // 步数用尽：强制收束，不再允许工具调用
         DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] agent 达到最大步数，强制收束");
         messages.Add(new ChatMessage { Role = "user", Content = "[system] 已达到最大工具调用次数。不要再输出 [tool] 块，直接基于已有结果给用户最终回答。" });
-        var final = await CompleteAsync(messages, ct);
-        return StripToolBlocks(final ?? "");
+        var rawFinal = (await CompleteAsync(messages, ct)) ?? "";
+        var final = PreprocessReply != null ? PreprocessReply(rawFinal, false) : rawFinal; // 最终回答同样过插件链
+        return StripToolBlocks(final);
     }
 
     private string DeclineResult(string name) =>
