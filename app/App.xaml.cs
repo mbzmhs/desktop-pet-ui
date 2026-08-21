@@ -568,13 +568,13 @@ public partial class App : System.Windows.Application
             }
         }
 
-        public Task<bool> SendEventAsync(string text, bool allowAgent, CancellationToken ct)
+        public Task<bool> SendEventAsync(string text, string? instruction, bool allowAgent, CancellationToken ct)
         {
             if (app._chatPipeline == null || App.PetWindow == null) return Task.FromResult(false);
             try
             {
                 var win = App.PetWindow!;
-                return win.Dispatcher.Invoke(() => app._chatPipeline!.RunAsync(text, win, asEvent: true, allowAgent));
+                return win.Dispatcher.Invoke(() => app._chatPipeline!.RunAsync(text, win, asEvent: true, allowAgent, eventInstruction: instruction));
             }
             catch (Exception ex)
             {

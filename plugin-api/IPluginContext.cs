@@ -16,9 +16,12 @@ public interface IPluginContext
     /// 进入上下文（对模型呈现为 system 而非 user），历史与聊天窗也用独立样式——模型不会把它当成用户本人说的话。
     /// <paramref name="allowAgent"/>：本轮是否允许 agent 工具链。**默认 false**——第三方内容是不可信输入，
     /// 不应触发电脑操作等工具（防注入）；仅当插件确信内容安全时才传 true。
+    /// <paramref name="instruction"/>：可选的**每事件指令**——插件针对这条具体事件告诉模型该如何处理
+    /// （如"这是一份礼物，请向观众真诚道谢"）。宿主只负责把它拼进通用的事件触发词，不解释其含义；
+    /// 传 null 则本轮只有宿主的通用框架。这样"每种事件怎么处理"完全由插件决定，宿主保持插件无关。
     /// 文本建议自带醒目标记前缀（如「【直播间】」）并在 system prompt 片段里解释其含义。排队语义同 <see cref="SendChatAsync"/>。
     /// </summary>
-    Task<bool> SendEventAsync(string text, bool allowAgent = false, CancellationToken ct = default);
+    Task<bool> SendEventAsync(string text, string? instruction = null, bool allowAgent = false, CancellationToken ct = default);
 
     /// <summary>获取当前 Pet 信息（角色/情绪/缩放/窗口位置等）。</summary>
     PetSnapshot GetPetInfo();

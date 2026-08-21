@@ -203,6 +203,8 @@ public static class LlamaClient
             ["max_tokens"] = maxTokens,
             ["stream"] = stream,
         };
+        // 注：事件的 user 触发已由 ChatPipeline 持久化进 history（event→user 交替），这里不再临时补；
+        // 正常路径下请求恒以 user 收尾，DeepSeek 不会丢弃中间 system / 合并重复会话。
         if (stream) payload["stream_options"] = new JsonObject { ["include_usage"] = true };
         if (!string.IsNullOrWhiteSpace(extraParams))
         {
@@ -222,6 +224,25 @@ public static class LlamaClient
             }
         }
         return payload.ToJsonString();
+    }
+
+    /// <summary>诊断日志：请求负载指纹（SHA256 前 12 位）+ 末尾消息的角色/长度/内容片段。
+    /// 用途：若连续两轮回复逐字节相同，对比这两行的 payload——相同=请求被冻结（上游 bug），不同=服务端对异质请求返回了相同补全。</summary>
+    private static void LogPayloadFingerprint(IReadOnlyList<ChatMessage> messages, string json)
+    {
+        try
+        {
+            var h = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(json));
+            var parts = new List<string>();
+            foreach (var m in messages.Skip(Math.Max(0, messages.Count - 3)))
+            {
+                var c = (m.Content ?? "").Trim().Replace("\n", " ");
+                parts.Add($"{m.Role}:{c.Length}字「{(c.Length > 24 ? c[..24] : c)}」");
+            }
+            var endRole = messages.Count > 0 ? messages[^1].Role : "-";
+            Log.Info($"[llm] payload=0x{Convert.ToHexString(h)[..12]} msgs={messages.Count} end={endRole} tail=[{string.Join(" | ", parts)}]");
+        }
+        catch { /* 诊断日志失败不影响主流程 */ }
     }
 
     private static object ToPayload(ChatMessage m)
@@ -299,6 +320,7 @@ public static class LlamaClient
         var url = baseUrl + "/v1/chat/completions";
 
         var json = BuildChatPayload(messages, useModel, temperature, maxTokens, extraParams, stream: false);
+        LogPayloadFingerprint(messages, json); // 诊断：连续轮次回复逐字节相同时，对比请求是否真的不同
         if (OnRequest != null) OnRequest(url, RedactImages(json));
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
@@ -371,6 +393,7 @@ public static class LlamaClient
         var useModel = string.IsNullOrWhiteSpace(model) ? "local" : model;
         var url = baseUrl + "/v1/chat/completions";
         var json = BuildChatPayload(messages, useModel, temperature, maxTokens, extraParams, stream: true);
+        LogPayloadFingerprint(messages, json); // 诊断：连续轮次回复逐字节相同时，对比请求是否真的不同
         if (OnRequest != null) OnRequest(url, RedactImages(json));
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };

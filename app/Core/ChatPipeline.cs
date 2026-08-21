@@ -483,7 +483,7 @@ public sealed class ChatPipeline : IDisposable
     /// <param name="asEvent">true=第三方事件（插件 SendEventAsync，如直播间弹幕）：历史记 Role="event"，
     /// 对模型呈现为 system（叙述者）而非 user——模型不会把观众发言当成用户本人说的话；聊天窗用独立紧凑样式。</param>
     /// <param name="allowAgent">false=本轮不启用 agent 工具链（即使全局开启）：第三方事件默认 false，防不可信内容注入电脑操作指令。</param>
-    public async Task<bool> RunAsync(string userText, ISpeakHost host, bool asEvent, bool allowAgent = true)
+    public async Task<bool> RunAsync(string userText, ISpeakHost host, bool asEvent, bool allowAgent = true, string? eventInstruction = null)
     {
         await _gate.WaitAsync();
         IsRunning = true;
@@ -492,7 +492,14 @@ public sealed class ChatPipeline : IDisposable
         _runCts = cts;
         try
         {
-            lock (_histLock) _history.Add(new ChatMessage { Role = asEvent ? "event" : "user", Content = userText });
+            lock (_histLock)
+            {
+                _history.Add(new ChatMessage { Role = asEvent ? "event" : "user", Content = userText });
+                if (asEvent)
+                    // 事件后紧跟一条持久化 user 触发（同主动搭话的沉默回合同构）：wire 呈 event(system)→user→assistant 正常交替，
+                    // DeepSeek 不再丢弃中间 system / 合并重复会话；这条也是留给模型的持久痕迹，且只此一次 LLM 调用
+                    _history.Add(new ChatMessage { Role = "user", Content = EventReplyTrigger(eventInstruction) });
+            }
             NotifyHistory();
             Status?.Invoke("思考中…");
 
@@ -504,7 +511,7 @@ public sealed class ChatPipeline : IDisposable
                 rawReply = await _agent.RunAsync(messages, host, cts.Token); // 工具循环（中间往返经 OnMessage 进长期历史）
             else
             {
-                rawReply = await CompleteAsync(messages, null, cts.Token, onDelta: _ => { }); // 流式：聊天窗实时打字（ReplyDelta 事件）
+                rawReply = await CompleteAsync(messages, null, cts.Token, onDelta: _ => { }, streamToUi: !asEvent); // 事件回复不进 UI 流式（防 [SKIP] 闪烁）；正常聊天实时打字
                 // agent 关闭时模型若模仿历史输出 [tool]：回灌"工具不可用"纠正并让它改用文字回答（最多 2 次），往返持久化防止复发
                 const string noToolFeedback = "[error] Agent 功能未开启，无法调用工具。请直接用文字回答：可以说明需要做什么、或提醒用户在设置里开启 Agent 后再试。不要再输出 [tool] 块。";
                 for (var guard = 0; guard < 2 && rawReply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0; guard++)
@@ -516,17 +523,20 @@ public sealed class ChatPipeline : IDisposable
                     }
                     messages.Add(new ChatMessage { Role = "assistant", Content = rawReply });
                     messages.Add(new ChatMessage { Role = "user", Content = noToolFeedback });
-                    rawReply = await CompleteAsync(messages, null, cts.Token, onDelta: _ => { });
+                    rawReply = await CompleteAsync(messages, null, cts.Token, onDelta: _ => { }, streamToUi: !asEvent);
                 }
                 if (rawReply.IndexOf("[tool]", StringComparison.OrdinalIgnoreCase) >= 0)
                     rawReply = AgentRunner.StripToolBlocks(rawReply); // 仍不合规：剥离工具块只留文字部分
             }
             rawReply = PluginManager.RunReplyChain(rawReply, new ReplyContext { Source = "final", IsAgentStep = false }); // 插件消息链（最终回答）
-            // [SKIP] 协议：最终回答恰为 [SKIP]（插件可在消息链强制，如直播间"跳过不想回应的弹幕"）= 本轮不产生可见输出——
-            // 不朗读不出气泡；历史写一条紧凑标记保持 user/assistant 交替，后续上下文知道"宠物选择了沉默"
-            if (string.Equals(rawReply.Trim(), "[SKIP]", StringComparison.OrdinalIgnoreCase))
+            // 空回复 = 本轮不产生可见输出（插件可在消息链把"跳过"翻译成空，如直播间跳过不想回的弹幕）——
+            // 不朗读不出气泡；历史写一条紧凑标记保持 user/assistant 交替，后续上下文知道"宠物选择了沉默"。宿主不认识具体协议词，只认空。
+            // 另：模型可能把下面这条跳过标记当样例复读回来（而非用插件的跳过词）——识别并吞掉，同样不朗读不出气泡。
+            // 标记用非对话协议标签 [no-reply]（明显不是台词）：防止被当聊天内容混入、或被模型复读成语音。
+            const string skipMarker = "[no-reply]";
+            if (string.IsNullOrWhiteSpace(rawReply) || rawReply.Contains("no-reply"))
             {
-                lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = "[system] 本轮未回应。" });
+                lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = skipMarker });
                 NotifyHistory();
                 Status?.Invoke("");
                 return true;
@@ -625,54 +635,41 @@ public sealed class ChatPipeline : IDisposable
         }
     }
 
+    /// <summary>系统生成消息的统一前缀标记：这类 user 消息并非用户本人所说（主动搭话沉默指令、事件触发），聊天窗据此隐藏其蓝色气泡。
+    /// 固定用英文 [SYSTEM]——这些消息只进模型上下文、不在 UI 显示，英文对指令遵循最稳；检测端按 [SYSTEM] 前缀匹配。</summary>
+    private static string SysPrefix() => "[SYSTEM] ";
+
     private string RandomSilenceTurn()
     {
-        var lang = _config.EffectiveTextLang;
-        string[] arr;
-        if (lang == "ja")
-            arr = new[]
-            {
-                "（しばらく沈黙が続いています。あなたから話しかけてください）",
-                "（ユーザーはまだ何も言っていません。新しい話題を振ってください）",
-                "（静かな時間が続いています。今日の出来事や気になることを話しかけてください）",
-            };
-        else if (lang == "en")
-            arr = new[]
-            {
-                "(There has been a long silence. Please start a conversation.)",
-                "(The user hasn't said anything yet. Bring up a new topic.)",
-                "(It's been quiet for a while. Talk about today's events or something on your mind.)",
-            };
-        else
-            arr = new[]
-            {
-                "（沉默了一会儿，请主动开口说话）",
-                "（用户还没有说话，主动挑个新话题吧）",
-                "（安静了一会儿，说说今天的事或你想到的事）",
-            };
-        return arr[Random.Shared.Next(arr.Length)];
+        var arr = new[]
+        {
+            "(There has been a long silence. Please start a conversation.)",
+            "(The user hasn't said anything yet. Bring up a new topic.)",
+            "(It's been quiet for a while. Talk about today's events or something on your mind.)",
+        };
+        return SysPrefix() + arr[Random.Shared.Next(arr.Length)];
     }
 
+    /// <summary>事件（弹幕/礼物等）入库后紧跟的 user 触发：让 wire 以 user 收尾、正常交替，模型据此决定是否回应。
+    /// 必须带 [SYSTEM] 标记——LIVE ROOM MODE 规则是"Only UNMARKED messages come from your user"，无标记的 user 消息会被当成用户本人，
+    /// 导致角色把观众弹幕误当用户的话来回应；标成系统转发后即被排除出"用户"，并明确指示回应的是那位观众而非用户。
+    /// 跳过机制（输出什么、如何表示不回应）归插件的 system prompt 定义，这里只要求"回应这位观众或保持沉默"。固定英文（不在 UI 显示）。</summary>
+    // 宿主只是 [SYSTEM] 结构包装：把插件给出的每事件指令原样放进 user 触发词（尾部，贴近决策点、比 system 头部遵循度更高）。
+    // 不含任何处理策略；插件未给指令时给一条最中性兜底。彻底解耦——"怎么回/跳过/格式/别续旧话题"全由插件在指令里决定。
+    private string EventReplyTrigger(string? pluginInstruction = null)
+        => SysPrefix() + (string.IsNullOrWhiteSpace(pluginInstruction) ? "(Handle the event above per your rules.)" : pluginInstruction);
+
+    // 固定英文 + [SYSTEM] 前缀（与事件触发/沉默指令同约定）：只进模型上下文、不在 UI 显示，英文对指令遵循最稳。
+    // 回复语言由主 system prompt 的 LANGUAGE 段决定，这里用英文不影响角色用配置语言搭话。
     private string ProactiveInstruction()
-    {
-        var lang = _config.EffectiveTextLang;
-        if (lang == "ja")
-            return "今はあなたが話しかける番です。ユーザーはしばらく話していません。過去の会話（摘要）の続きではなく、新しい話題（今日の出来事・趣味・相手の近況など）を1つ話しかけてください。1文以内、同じフレーズや同じ話題の繰り返しは避けてください。文の先頭に感情タグを付けてください。";
-        if (lang == "en")
-            return "It's your turn to start a conversation. The user has been silent for a while. Don't continue the past conversation (summary); instead bring up a new topic (today's events, hobbies, how the user is doing, etc.). Say it in at most one sentence, avoid repeating the same phrases or topics. Start with one emotion tag.";
-        return "现在轮到你主动开口了。用户已经沉默了一会儿。不要接着之前的话题（摘要）继续，而是挑一个新话题（今天发生的事、兴趣爱好、对方近况等）主动说一句。不超过一句话，避免重复说过的话或话题。开头带上情感标签。";
-    }
+        => SysPrefix() + "PROACTIVE TURN: It is your turn to start a conversation; the user has been silent for a while. Do NOT continue the past conversation (summary) — bring up ONE new topic (today's events, hobbies, how the user is doing, etc.). Keep it to at most one sentence and avoid repeating phrases or topics you have used before. Start your reply with one emotion tag.";
 
     private string ProactiveRepeatInstruction()
-    {
-        var lang = _config.EffectiveTextLang;
-        if (lang == "ja") return "（さっきと同じ内容を言いました。別の新しい話題で話しかけてください）";
-        if (lang == "en") return "(You just said the same thing. Please start a conversation with a different new topic.)";
-        return "（刚才说了重复的内容，请换个新话题搭话）";
-    }
+        => SysPrefix() + "You just said essentially the same thing again. Start a conversation with a DIFFERENT new topic instead.";
 
     /// <param name="onDelta">非 null 且 StreamEnabled 时走 SSE 流式（每片回调累计全文）；否则原非流式整包路径。</param>
-    private async Task<string> CompleteAsync(List<ChatMessage> messages, double? temperatureOverride = null, CancellationToken ct = default, Action<string>? onDelta = null)
+    /// <param name="streamToUi">是否把流式增量转发到聊天窗打字气泡（ReplyDelta/ReplyStreamEnd）。事件回复传 false：弹幕短、常跳过且为第三方触发，实时打字会把 [SKIP] 之类协议词闪出来；正常聊天/主动搭话保持 true。</param>
+    private async Task<string> CompleteAsync(List<ChatMessage> messages, double? temperatureOverride = null, CancellationToken ct = default, Action<string>? onDelta = null, bool streamToUi = true)
     {
         var ep = _config.EffectiveLlm();
         DebugLog?.Invoke(FormatRequest(ep.Url, ep.Model, messages));
@@ -689,7 +686,7 @@ public sealed class ChatPipeline : IDisposable
                     ep.Model,
                     temperatureOverride ?? _config.EffectiveTemperature,
                     _config.EffectiveMaxTokens,
-                    soFar => { if (firstDelta) { firstDelta = false; _streamStepStartTs = DateTime.Now; } onDelta(soFar); ReplyDelta?.Invoke(soFar); },
+                    soFar => { if (firstDelta) { firstDelta = false; _streamStepStartTs = DateTime.Now; } onDelta(soFar); if (streamToUi) ReplyDelta?.Invoke(soFar); },
                     ep.ApiKey,
                     ep.ExtraParams,
                     ct);
@@ -697,7 +694,7 @@ public sealed class ChatPipeline : IDisposable
             }
             finally
             {
-                ReplyStreamEnd?.Invoke(streamOk); // 完成=移除气泡；出错/停止=冻结已显示文本
+                if (streamToUi) ReplyStreamEnd?.Invoke(streamOk); // 完成=移除气泡；出错/停止=冻结已显示文本
             }
         }
         else

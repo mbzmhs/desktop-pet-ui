@@ -575,7 +575,8 @@ internal sealed class BiliWsClient
                         text += $"（含月舰长x{guardCount}）";
                         priceYuan = Math.Max(priceYuan, guardCount * 198); // 至少按舰长价计
                     }
-                    result.Add(new LiveEvent(LiveKind.Gift, GetStr(gd, "username"), GetLong(gd, "uid") > 0 ? GetLong(gd, "uid") : -1, text, priceYuan));
+                    var uname = GetStr(gd, "uname"); if (uname.Length == 0) uname = GetStr(gd, "username"); // B站 SEND_GIFT 昵称字段是 uname（个别/旧版本 username）
+                    result.Add(new LiveEvent(LiveKind.Gift, uname, GetLong(gd, "uid") > 0 ? GetLong(gd, "uid") : -1, text, priceYuan));
                 }
                 break;
 

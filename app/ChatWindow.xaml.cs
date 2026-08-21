@@ -319,6 +319,8 @@ public partial class ChatWindow : Window
         var items = new List<(DateTime Ts, FrameworkElement El, string Kind)>();
         foreach (var m in history)
         {
+            // 系统生成的消息不显示为对话文字：[SYSTEM] user 触发（沉默指令/事件触发）+ [SKIP] 跳过占位标记
+            if (IsHiddenSystemRelay(m) || IsSkipMarker(m)) continue;
             var isUser = m.Role == "user";
             // 第三方事件（直播间弹幕等，Role="event"）：独立紧凑行，与用户蓝气泡/角色灰气泡明确区分
             var content = m.Content ?? "";
@@ -972,6 +974,18 @@ public partial class ChatWindow : Window
     };
 
     /// <summary>是否 agent 协议消息（[tool] 调用 / [result] [error] [note] 反馈 / [system] 系统标记），区别于普通对话。</summary>
+    /// <summary>系统生成的 user 消息（非用户本人所说）：带 [SYSTEM] 前缀——主动搭话的沉默指令、直播间事件触发。
+    /// 这类消息进模型上下文/记忆但不在聊天窗显示蓝色气泡，避免与真人发言混淆。</summary>
+    private static bool IsHiddenSystemRelay(ChatMessage m)
+    {
+        if (m.Role != "user") return false;
+        return (m.Content ?? "").TrimStart().StartsWith("[SYSTEM]", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>跳过占位标记 [no-reply]：历史里保留以维持 user/assistant 交替 + 让模型知道宠物选了沉默，但不在聊天窗显示。</summary>
+    private static bool IsSkipMarker(ChatMessage m)
+        => m.Role == "assistant" && (m.Content ?? "").Contains("no-reply");
+
     private static bool IsProtocolMessage(ChatMessage m)
     {
         var c = (m.Content ?? "").TrimStart();

@@ -14,7 +14,7 @@ namespace DesktopPetUi.Core.Plugin;
 internal interface IPluginHostBridge
 {
     Task<bool> SendChatAsync(string text, CancellationToken ct);
-    Task<bool> SendEventAsync(string text, bool allowAgent, CancellationToken ct);
+    Task<bool> SendEventAsync(string text, string? instruction, bool allowAgent, CancellationToken ct);
     PetSnapshot GetPetInfo();
 }
 
@@ -157,7 +157,8 @@ public static class PluginManager
     private static bool IsPluginType(Type? t) =>
         t != null && !t.IsAbstract && !t.IsInterface && typeof(IPlugin).IsAssignableFrom(t) && t.GetConstructor(Type.EmptyTypes) != null;
 
-    /// <summary>消息链：LLM 回复流式结束后、工具解析前，按文件名顺序逐插件传递。异常保留上一段文本继续传。</summary>
+    /// <summary>消息链：LLM 回复流式结束后、工具解析前，按文件名顺序逐插件传递。异常保留上一段文本继续传。
+    /// 某插件把回复置空（返回 ""）= 本轮跳过（如直播间 [SKIP]），立即短路后续插件——避免别的插件把空串重新填上；null=不改动。</summary>
     public static string RunReplyChain(string reply, ReplyContext ctx)
     {
         var active = ActiveList();
@@ -167,7 +168,9 @@ public static class PluginManager
             try
             {
                 var r = p.Instance!.PreprocessReply(reply, ctx);
-                if (!string.IsNullOrEmpty(r)) reply = r;
+                if (r == null) continue; // 返回 null=不改动（防御）
+                reply = r;
+                if (reply.Length == 0) break; // 置空=跳过，短路后续插件
             }
             catch (Exception ex)
             {
@@ -343,7 +346,7 @@ public static class PluginManager
     private sealed class PluginContext(string name, IPluginHostBridge bridge) : IPluginContext
     {
         public Task<bool> SendChatAsync(string text, CancellationToken ct) => bridge.SendChatAsync(text, ct);
-        public Task<bool> SendEventAsync(string text, bool allowAgent = false, CancellationToken ct = default) => bridge.SendEventAsync(text, allowAgent, ct);
+        public Task<bool> SendEventAsync(string text, string? instruction = null, bool allowAgent = false, CancellationToken ct = default) => bridge.SendEventAsync(text, instruction, allowAgent, ct);
         public PetSnapshot GetPetInfo() => bridge.GetPetInfo();
         public void Log(string message) => DesktopPetUi.Log.Info("[plugin:" + name + "] " + message); // 全限定：避免与成员方法 Log 自引用
     }
