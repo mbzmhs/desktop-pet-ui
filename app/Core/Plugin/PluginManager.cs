@@ -14,6 +14,7 @@ namespace DesktopPetUi.Core.Plugin;
 internal interface IPluginHostBridge
 {
     Task<bool> SendChatAsync(string text, CancellationToken ct);
+    Task<bool> SendEventAsync(string text, bool allowAgent, CancellationToken ct);
     PetSnapshot GetPetInfo();
 }
 
@@ -194,6 +195,26 @@ public static class PluginManager
         return string.Join("\n", lines);
     }
 
+    /// <summary>活动插件的自定义提示片段（追加到 systemPrompt 尾部；无则返回 ""）。每次请求现取，禁用即不再注入。</summary>
+    public static string SystemPromptSuffix()
+    {
+        var parts = new List<string>();
+        foreach (var p in ActiveList())
+            if (p.Instance is ISystemPromptContributor c)
+            {
+                try
+                {
+                    var s = c.GetSystemPromptPart()?.Trim();
+                    if (!string.IsNullOrEmpty(s)) parts.Add(s);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("plugins: " + p.Info!.Name + " GetSystemPromptPart 异常（跳过该插件片段）", ex);
+                }
+            }
+        return string.Join("\n\n", parts);
+    }
+
     /// <summary>执行插件工具（异常隔离，错误文本回喂模型）。</summary>
     public static async Task<string> ExecutePluginToolAsync(LoadedPlugin p, string name, System.Text.Json.Nodes.JsonObject args, string reason, CancellationToken ct)
     {
@@ -322,6 +343,7 @@ public static class PluginManager
     private sealed class PluginContext(string name, IPluginHostBridge bridge) : IPluginContext
     {
         public Task<bool> SendChatAsync(string text, CancellationToken ct) => bridge.SendChatAsync(text, ct);
+        public Task<bool> SendEventAsync(string text, bool allowAgent = false, CancellationToken ct = default) => bridge.SendEventAsync(text, allowAgent, ct);
         public PetSnapshot GetPetInfo() => bridge.GetPetInfo();
         public void Log(string message) => DesktopPetUi.Log.Info("[plugin:" + name + "] " + message); // 全限定：避免与成员方法 Log 自引用
     }

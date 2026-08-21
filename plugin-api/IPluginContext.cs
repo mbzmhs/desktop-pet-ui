@@ -11,6 +11,15 @@ public interface IPluginContext
     /// </summary>
     Task<bool> SendChatAsync(string text, CancellationToken ct = default);
 
+    /// <summary>
+    /// 向宠物注入一条**第三方事件**（如直播间弹幕/礼物）：同样走完整管线并触发回复，但消息以"叙述者"身份
+    /// 进入上下文（对模型呈现为 system 而非 user），历史与聊天窗也用独立样式——模型不会把它当成用户本人说的话。
+    /// <paramref name="allowAgent"/>：本轮是否允许 agent 工具链。**默认 false**——第三方内容是不可信输入，
+    /// 不应触发电脑操作等工具（防注入）；仅当插件确信内容安全时才传 true。
+    /// 文本建议自带醒目标记前缀（如「【直播间】」）并在 system prompt 片段里解释其含义。排队语义同 <see cref="SendChatAsync"/>。
+    /// </summary>
+    Task<bool> SendEventAsync(string text, bool allowAgent = false, CancellationToken ct = default);
+
     /// <summary>获取当前 Pet 信息（角色/情绪/缩放/窗口位置等）。</summary>
     PetSnapshot GetPetInfo();
 

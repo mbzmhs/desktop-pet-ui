@@ -226,12 +226,14 @@ public static class LlamaClient
 
     private static object ToPayload(ChatMessage m)
     {
+        // event（第三方事件，如直播间弹幕）对模型呈现为 system 叙述者：与 user 严格区分，防模型把观众发言当用户说的话
+        var role = m.Role == "event" ? "system" : m.Role;
         if (m.ImageBase64s == null || m.ImageBase64s.Count == 0)
-            return new { role = m.Role, content = m.Content };
+            return new { role, content = m.Content };
         var parts = new List<object> { new { type = "text", text = m.Content } };
         foreach (var b in m.ImageBase64s)
             parts.Add(new { type = "image_url", image_url = new { url = "data:image/png;base64," + b } });
-        return new { role = m.Role, content = parts.ToArray() };
+        return new { role, content = parts.ToArray() };
     }
 
     public static async Task<List<ModelInfo>> FetchModelsAsync(string baseUrl, string? apiKey = null, CancellationToken ct = default)

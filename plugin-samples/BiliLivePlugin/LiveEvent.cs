@@ -55,19 +55,20 @@ internal sealed class LiveFilter
 /// <summary>发给 Pet 的消息格式化（明确标注直播间来源，让模型知道这不是用户本人输入）。</summary>
 internal static class LiveFormat
 {
+    // 全角【】标记：与模型自身协议括号（[tool]/情绪标签）视觉区隔，且 system prompt 按此识别观众事件
     public static string Format(LiveEvent e) => e.Kind switch
     {
-        LiveKind.Gift => $"[直播间] 礼物：{e.User}送出 {e.Text}（价值{Money(e.PriceYuan)}）",
-        LiveKind.Sc => $"[直播间] 醒目留言：{e.User}留言「{e.Text}」（{Money(e.PriceYuan)}）",
-        LiveKind.Interact => $"[直播间] 互动：{e.User}{e.Text}",
-        _ => string.IsNullOrEmpty(e.User) ? $"[直播间] 弹幕：「{e.Text}」" : $"[直播间] 弹幕：{e.User}说「{e.Text}」",
+        LiveKind.Gift => $"【直播间】礼物：观众「{e.User}」送出 {e.Text}（价值{Money(e.PriceYuan)}）",
+        LiveKind.Sc => $"【直播间】醒目留言：观众「{e.User}」留言「{e.Text}」（{Money(e.PriceYuan)}）",
+        LiveKind.Interact => $"【直播间】互动：观众「{e.User}」{e.Text}",
+        _ => string.IsNullOrEmpty(e.User) ? $"【直播间】弹幕：观众说「{e.Text}」" : $"【直播间】弹幕：观众「{e.User}」说「{e.Text}」",
     };
 
     /// <summary>窗口合并后的多条弹幕（保持 FIFO 顺序编号）。</summary>
     public static string FormatBatch(IReadOnlyList<LiveEvent> batch)
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append("[直播间] 弹幕（").Append(batch.Count).Append("条）：\n");
+        sb.Append("【直播间】弹幕（").Append(batch.Count).Append("条，均为观众发言）：\n");
         for (var i = 0; i < batch.Count; i++)
         {
             sb.Append(i + 1).Append(". ");

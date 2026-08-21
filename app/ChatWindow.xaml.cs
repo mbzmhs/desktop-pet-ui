@@ -317,19 +317,24 @@ public partial class ChatWindow : Window
         foreach (var m in history)
         {
             var isUser = m.Role == "user";
+            // 第三方事件（直播间弹幕等，Role="event"）：独立紧凑行，与用户蓝气泡/角色灰气泡明确区分
+            var content = m.Content ?? "";
+            var isEvent = m.Role == "event";
             // 缓存键含展开态：[result]/[error] 折叠/切换展开时重建为不同元素
             var key = (isUser ? "u" : "a") + "\u0001" + m.Timestamp.Ticks + "\u0001" + m.Content
                       + (_expanded.Contains(m.Content) ? "\u0002e" : "");
-            var proto = IsProtocolMessage(m);
+            var proto = !isEvent && IsProtocolMessage(m);
             FrameworkElement el;
             if (!_msgElCache.TryGetValue(key, out el))
             {
-                el = proto
-                    ? BuildExchangeLine(m)
-                    : BuildBubble(isUser, isUser ? "你" : name, m.Timestamp, ToDisplay(m.Content));
+                el = isEvent
+                    ? BuildEventLine(m)
+                    : proto
+                        ? BuildExchangeLine(m)
+                        : BuildBubble(isUser, isUser ? "你" : name, m.Timestamp, ToDisplay(content));
                 _msgElCache[key] = el;
             }
-            items.Add((m.Timestamp, el, isUser ? (proto ? "protoU" : "user") : (proto ? "toolA" : "asst")));
+            items.Add((m.Timestamp, el, isEvent ? "event" : (isUser ? (proto ? "protoU" : "user") : (proto ? "toolA" : "asst"))));
         }
         // 早于第一条聊天记录的 agent 操作不进窗（清空记录后不残留一排孤行）；数据仍在 agent_ops.json，记忆管理器可见可清
         foreach (var op in _ops.Where(o => o.Ts >= firstTs))
@@ -1057,6 +1062,22 @@ public partial class ChatWindow : Window
         stack.Children.Add(BuildBubble(false, name, m.Timestamp, _prose));
         stack.Children.Add(tb);
         return stack;
+    }
+
+    /// <summary>第三方事件行（直播间弹幕/礼物等，Role="event"）：小字号低对比、左对齐带 » 前缀——
+    /// 明确不是用户蓝气泡也不是角色灰气泡，视觉上也帮模型/用户分清"谁在说话"。</summary>
+    private FrameworkElement BuildEventLine(ChatMessage m)
+    {
+        return new TextBlock
+        {
+            Text = "» " + (m.Content ?? ""),
+            FontSize = 11,
+            Foreground = MakeBrush("#7A8290"),
+            MaxWidth = Math.Max(240, MsgPanel.ActualWidth * 0.9),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(18, 2, 0, 2),
+        };
     }
 
     /// <summary>agent 操作记录行（区别于对话气泡）：裁定徽标 + 等宽命令详情 + 时间戳，灰底小卡。</summary>

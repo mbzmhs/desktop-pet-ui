@@ -297,6 +297,9 @@ public sealed class ChatPipeline : IDisposable
         // 只到日期（不带时分）：时分每轮都变，会击穿前缀缓存；模型需要精确时间时会自己问/用工具查
         var now = DateTime.Now;
         parts.Add("CURRENT TIME: " + now.ToString("yyyy-MM-dd") + " (" + WeekdaysEn[(int)now.DayOfWeek] + ")");
+        // 活动插件的自定义提示片段（如直播插件的互动说明）：追加在 systemPrompt 最尾部，每次请求现取，禁用即不再注入
+        var pluginPrompt = PluginManager.SystemPromptSuffix();
+        if (!string.IsNullOrEmpty(pluginPrompt)) parts.Add(pluginPrompt);
         return string.Join("\n\n", parts);
     }
 
@@ -472,7 +475,12 @@ public sealed class ChatPipeline : IDisposable
         }
     }
 
-    public async Task<bool> RunAsync(string userText, ISpeakHost host)
+    public Task<bool> RunAsync(string userText, ISpeakHost host) => RunAsync(userText, host, asEvent: false);
+
+    /// <param name="asEvent">true=第三方事件（插件 SendEventAsync，如直播间弹幕）：历史记 Role="event"，
+    /// 对模型呈现为 system（叙述者）而非 user——模型不会把观众发言当成用户本人说的话；聊天窗用独立紧凑样式。</param>
+    /// <param name="allowAgent">false=本轮不启用 agent 工具链（即使全局开启）：第三方事件默认 false，防不可信内容注入电脑操作指令。</param>
+    public async Task<bool> RunAsync(string userText, ISpeakHost host, bool asEvent, bool allowAgent = true)
     {
         await _gate.WaitAsync();
         IsRunning = true;
@@ -480,7 +488,7 @@ public sealed class ChatPipeline : IDisposable
         _runCts = cts;
         try
         {
-            lock (_histLock) _history.Add(new ChatMessage { Role = "user", Content = userText });
+            lock (_histLock) _history.Add(new ChatMessage { Role = asEvent ? "event" : "user", Content = userText });
             NotifyHistory();
             Status?.Invoke("思考中…");
 
@@ -488,7 +496,7 @@ public sealed class ChatPipeline : IDisposable
             NotifyHistory();
             var messages = await BuildMessagesAsync();
             string rawReply;
-            if (_config.Chat.Agent.Enabled)
+            if (_config.Chat.Agent.Enabled && allowAgent)
                 rawReply = await _agent.RunAsync(messages, host, cts.Token); // 工具循环（中间往返经 OnMessage 进长期历史）
             else
             {
@@ -510,6 +518,15 @@ public sealed class ChatPipeline : IDisposable
                     rawReply = AgentRunner.StripToolBlocks(rawReply); // 仍不合规：剥离工具块只留文字部分
             }
             rawReply = PluginManager.RunReplyChain(rawReply, new ReplyContext { Source = "final", IsAgentStep = false }); // 插件消息链（最终回答）
+            // [SKIP] 协议：最终回答恰为 [SKIP]（插件可在消息链强制，如直播间"跳过不想回应的弹幕"）= 本轮不产生可见输出——
+            // 不朗读不出气泡；历史写一条紧凑标记保持 user/assistant 交替，后续上下文知道"宠物选择了沉默"
+            if (string.Equals(rawReply.Trim(), "[SKIP]", StringComparison.OrdinalIgnoreCase))
+            {
+                lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = "[system] 本轮未回应。" });
+                NotifyHistory();
+                Status?.Invoke("");
+                return true;
+            }
             lock (_histLock) _history.Add(new ChatMessage { Role = "assistant", Content = rawReply });
             NotifyHistory();
 

@@ -6,7 +6,8 @@
 |---|---|
 | 消息链 | LLM 回复流式结束以后、工具解析之前，逐插件传递文本（可改写/过滤/追加） |
 | 工具路由 | 声明工具名后，模型 `[tool]` 调用命中即分发给你执行（直接执行，不弹权限确认；每次调用记入 `agent_ops.json`，verdict=plugin） |
-| 代替用户发消息 | `ctx.SendChatAsync(text)` 走完整聊天管线（与用户打字同路径，自动排队、进历史、驱动情绪/语音） |
+| 代替用户发消息 | `ctx.SendChatAsync(text)` 走完整聊天管线（与用户打字同路径，消息以 user 身份进入上下文） |
+| 注入第三方事件 | `ctx.SendEventAsync(text)` 同样走完整管线，但消息以"叙述者"身份进入上下文（对模型是 system 而非 user，历史 Role="event"，聊天窗独立紧凑行）——适合直播间弹幕等**不是用户本人说的话** |
 | 设定持久化 | 声明设定项，宿主设置页「插件设置」Tab 渲染控件并写入 `plugin.json`；支持热启用/禁用 |
 
 ## 1. 工程搭建
@@ -54,11 +55,21 @@ public interface IPlugin
 
 public interface IPluginContext
 {
-    Task<bool> SendChatAsync(string text, CancellationToken ct); // 代替用户发消息（完整管线）
+    Task<bool> SendChatAsync(string text, CancellationToken ct);                    // 代替用户发消息（完整管线，消息以 user 身份进入上下文，agent 按全局开关）
+    Task<bool> SendEventAsync(string text, bool allowAgent = false, CancellationToken ct = default); // 注入第三方事件（如直播间弹幕）：历史记 Role="event"，对模型呈现为 system 叙述者而非 user；聊天窗用独立紧凑行。allowAgent=false（默认）=本轮不启用 agent 工具链——第三方内容不可信，防注入电脑操作指令。文本建议自带醒目标记前缀并在 GetSystemPromptPart 里解释
     PetSnapshot GetPetInfo();                                    // 当前角色/情绪/缩放/窗口位置/功能开关
     void Log(string message);                                    // 写入宿主日志（带 [plugin:名] 前缀）
 }
+
+// 可选扩展：再实现这个接口，返回的文本会追加到 system prompt 尾部（活动插件按文件名顺序，空行分隔）。
+// 每次 LLM 请求都会调用 → 必须轻量（只读状态拼字符串，不做 IO）；返回 null/空 = 本次不注入。
+public interface ISystemPromptContributor
+{
+    string? GetSystemPromptPart();
+}
 ```
+
+- **自定义 system prompt 片段**（`ISystemPromptContributor`，可选）：用于告知宠物插件引入的新上下文——例如直播插件注入"你正在直播间，要回应弹幕、感谢礼物"。只在功能激活时返回非空（如连接中），停用即自动消失；抛异常只跳过该插件片段，不影响其他插件与对话。
 
 - `PluginInfo`：Name（唯一标识，建议=dll 文件名）、Version、Author、Description、`Tools`（注入 systemPrompt 的工具定义）、`ToolNames`（路由清单）。
 - `ReplyContext.Source`：`"agent-step"`（中间工具步，文本可能含 `[tool]...[/tool]`，**不要破坏协议格式**）/ `"final"` / `"proactive"`。
@@ -68,11 +79,13 @@ public interface IPluginContext
 ## 3. 线程模型与约定
 
 - `Register` / `Shutdown` / 设置页操作：**UI 线程**，不要阻塞（别在里面做网络/IO）。
-- `PreprocessReply` / `ExecuteToolAsync` / `SendChatAsync` 的回调：后台线程。
+- `PreprocessReply` / `ExecuteToolAsync` / `SendChatAsync` / `SendEventAsync` 的回调：后台线程。
 - 任何方法抛异常都会被宿主隔离并记日志，但请自己保证状态一致。
-- `SendChatAsync` 走完整聊天管线（串行门），**没有频率限制护栏**——插件自负行为，避免高频调用刷屏/烧 token。
+- `SendChatAsync` / `SendEventAsync` 都走完整聊天管线（串行门），**没有频率限制护栏**——插件自负行为，避免高频调用刷屏/烧 token。
 - 工具直接执行、无权限确认：请保持只读或低风险；危险操作请自行向用户说明（可通过 `SendChatAsync` 告知）。
+- **工具只在 agent 开启的轮次可用**：agent 全局关闭、或该轮 `allowAgent=false`（如观众事件）时，工具定义不会注入 systemPrompt——依赖工具的插件功能在这些轮次不生效。对不可信内容触发的轮次，行为约定应走"prompt 说明 + 消息链解析协议文本（如 `[SKIP]`）"，而不是工具。
 - **消息链改过的文本会原样持久化进对话历史**，模型下一轮可能模仿/复读你追加的内容（如签名）。追加类改动务必做幂等检查：已含标记就不再追加。
+- **`[SKIP]` 静默协议**：最终回答（消息链处理后的结果）恰为 `[SKIP]`（忽略大小写与首尾空白）时，宿主视为"本轮不回应"——不朗读、不出气泡，历史里只留一条紧凑的 `[system] 本轮未回应。` 标记（保持 user/assistant 交替）。典型用法：system prompt 片段告知模型何时该跳过（最终回答只输出 `[SKIP]`），消息链 `Source="final"` 处可顺带统计。**与 Agent 开关无关**——不需要工具即可生效；对 `allowAgent=false` 的事件轮次这是唯一的跳过手段。
 
 ## 4. 部署与生效时机
 
