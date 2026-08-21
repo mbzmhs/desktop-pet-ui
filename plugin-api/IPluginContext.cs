@@ -33,8 +33,11 @@ public interface IPluginContext
 /// <summary>Pet 当前状态快照（值拷贝，可安全缓存）。</summary>
 public sealed class PetSnapshot
 {
-    /// <summary>当前角色名。</summary>
+    /// <summary>当前角色名（目录名，如「优香（睡衣）中文」）。</summary>
     public string Character { get; init; } = "";
+
+    /// <summary>当前角色的显示名（观众熟知的名字，如「早濑优香」；@点名匹配用这个）。</summary>
+    public string DisplayName { get; init; } = "";
 
     /// <summary>当前情绪标签（空=无/中性）。</summary>
     public string Emotion { get; init; } = "";

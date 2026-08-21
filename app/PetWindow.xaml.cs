@@ -634,6 +634,7 @@ public partial class PetWindow : Window, ISpeakHost
     public PetSnapshot GetSnapshot() => new()
     {
         Character = _config.Character.Current,
+        DisplayName = _config.EffectiveCharacterName,
         Emotion = _lastEmotion,
         Scale = _config.Character.Scale,
         WindowLeft = (int)Left,

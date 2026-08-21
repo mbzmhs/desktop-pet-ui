@@ -23,6 +23,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
     private bool _thankGift = true;     // 收到礼物（含上舰/舰长）时必谢：点名送礼人+具体礼物，防参照旧上下文乱谢
     private bool _thankSc = true;       // 收到醒目留言(SC)时必谢：点名留言人+具体内容
     private bool _thankInteract = true; // 收到有利互动（关注/特别关注/互粉/分享）时必谢：点名互动人+动作
+    private bool _connectWhenNotLive = true; // 未开播时也建立 WS 连接（true=主播一开播弹幕即达，省去轮询延迟；false=确认开播才连、60s 轮询复查）
     private int _minIntervalMs = 2000;    // 两次回应最小间隔（0=不限）
     private int _mergeWindowMs = 1500;    // 弹幕合并窗口（0=严格逐条）
     private int _maxQueue = 32;           // FIFO 队列上限（满丢新）
@@ -64,7 +65,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
         _dispTask = Task.Run(() => DispatcherAsync(Interlocked.Increment(ref _dispSeq), cts.Token)); // 分发器常驻（无事件时空等）
 
         var roomDesc = string.IsNullOrWhiteSpace(_roomCode) ? "未配置" : _roomCode;
-        ctx.Log($"注册成功（room={roomDesc}，弹幕={_respondDanmaku} 礼物={_respondGift} SC={_respondSc} 互动={_respondInteract}，合并窗口={_mergeWindowMs}ms，最小间隔={_minIntervalMs}ms）");
+        ctx.Log($"注册成功（room={roomDesc}，弹幕={_respondDanmaku} 礼物={_respondGift} SC={_respondSc} 互动={_respondInteract} 未开播连={_connectWhenNotLive}，合并窗口={_mergeWindowMs}ms，最小间隔={_minIntervalMs}ms）");
         RestartConnection(); // roomCode 为空则只记日志不建连
 
         // 不提供工具：观众事件以 allowAgent=false 发送（不启用 agent 工具链），工具定义不会出现，
@@ -135,7 +136,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
 
     /// <summary>每事件指令：由插件给出、经 SendEventAsync 拼进 user 触发词**尾部**（贴近模型决策点，遵循度高于 system 头部）。
     /// 有利互动（礼物/SC/关注等）开启必谢时，**点名具体的人 + 具体的事**——防止大模型参照旧上下文把感谢安到错误的人或事上；宿主只做 [SYSTEM] 包装。</summary>
-    private string BuildEventInstruction(LiveEvent e) => e.Kind switch
+    private string BuildEventInstruction(LiveEvent e, string? charName) => e.Kind switch
     {
         LiveKind.Gift when _thankGift && !string.IsNullOrWhiteSpace(e.User)
             => $"A viewer named 「{e.User}」 just sent you a gift: {e.Text}. Thank {e.User} warmly in character, mentioning exactly this gift ({e.Text}); do NOT thank anyone else or reference any earlier gift. Never skip this.",
@@ -143,8 +144,16 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
             => $"A viewer named 「{e.User}」 posted a paid message (SC): 「{e.Text}」. Thank {e.User} in character for exactly this message; do NOT reference any earlier viewer or message. Never skip this.",
         LiveKind.Interact when _thankInteract && !string.IsNullOrWhiteSpace(e.User)
             => $"A viewer named 「{e.User}」 {e.Text}. Acknowledge and thank {e.User} warmly in character for exactly this action ({e.Text}); do NOT reference any earlier viewer or action. Never skip this.",
+        // @点名：观众用角色名 @ 了宠物——单独成条、优先回应（实在不想回也可不回）
+        LiveKind.Danmaku when IsMention(e.Text, charName) && !string.IsNullOrWhiteSpace(e.User)
+            => $"A viewer named 「{e.User}」 just @-mentioned you by your name. Please reply to {e.User}; if you truly don't feel like it, you may also stay silent.",
         _ => BaseEventInstruction,
     };
+
+    /// <summary>弹幕是否 @ 了当前角色显示名（如「@早濑优香」）：charName 取自 GetPetInfo().DisplayName（回退 Character），缺失则不判定。</summary>
+    private static bool IsMention(string? text, string? charName)
+        => !string.IsNullOrWhiteSpace(text) && !string.IsNullOrWhiteSpace(charName)
+           && text.Contains("@" + charName, StringComparison.Ordinal);
 
     public Task<string> ExecuteToolAsync(ToolCall call, CancellationToken ct)
         => Task.FromResult("未知工具：" + call.Name); // 本插件不注册工具，此路径不可达（接口要求实现）
@@ -152,6 +161,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
     public IReadOnlyList<SettingDef> GetSettings() => new[]
     {
         new SettingDef { Name = "roomCode", Description = "B站直播间号（纯数字，如 123456；留空=不连接）", Type = SettingType.Int, Value = JsonSerializer.SerializeToElement(_roomCode) },
+        new SettingDef { Name = "connectWhenNotLive", Description = "未开播时也建立弹幕连接（开=主播一开播弹幕立即送达，省去轮询延迟；关=确认开播才连、每 60s 复查）", Type = SettingType.Bool, Value = JsonValue(_connectWhenNotLive) },
         new SettingDef { Name = "respondDanmaku", Description = "回应聊天弹幕", Type = SettingType.Bool, Value = JsonValue(_respondDanmaku) },
         new SettingDef { Name = "respondGift", Description = "回应礼物", Type = SettingType.Bool, Value = JsonValue(_respondGift) },
         new SettingDef { Name = "respondSc", Description = "回应醒目留言（SC）", Type = SettingType.Bool, Value = JsonValue(_respondSc) },
@@ -182,6 +192,12 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
                 _roomCode = raw.Trim();
                 if (changed) RestartConnection();
                 return new SettingResult(true);
+
+            case "connectWhenNotLive": {
+                var was = _connectWhenNotLive;
+                var r = SetBool(ref _connectWhenNotLive, value); if (!r.Ok) return r;
+                if (was != _connectWhenNotLive) RestartConnection(); // 立即按新策略（重）连接
+                break; }
 
             case "respondDanmaku": { var r = SetBool(ref _respondDanmaku, value); if (!r.Ok) return r; break; }
             case "respondGift": { var r = SetBool(ref _respondGift, value); if (!r.Ok) return r; break; }
@@ -264,7 +280,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
     {
         try
         {
-            await _ws!.RunAsync(roomId, OnLiveEvent, ct);
+            await _ws!.RunAsync(roomId, OnLiveEvent, _connectWhenNotLive, ct);
         }
         catch (Exception ex)
         {
@@ -311,17 +327,21 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
                     if (waitMs > 0) await Task.Delay((int)waitMs, ct);
                 }
 
-                // 弹幕进合并收集；礼物/SC 不合并、立即单独发（保持 FIFO：队首出现非弹幕即停止收集）
-                var batch = first.Kind == LiveKind.Danmaku && _mergeWindowMs > 0
-                    ? await CollectBatchAsync(ch.Reader, first, ct)
+                // 取一次 Pet 快照（走 UI 线程，受 minIntervalMs 节流每批至多一次）：角色名供 @点名检测 + 聊天开关
+                string? charName = null;
+                bool chatEnabled = true;
+                try { var s = _ctx?.GetPetInfo(); if (s != null) { charName = !string.IsNullOrWhiteSpace(s.DisplayName) ? s.DisplayName : s.Character; chatEnabled = s.ChatEnabled; } }
+                catch { /* 快照缺失：按启用处理（SendEventAsync 会兜底返回 false） */ }
+
+                // @了角色名的弹幕不合并、单独发（观众点名要即时且独立回应）；其余弹幕进合并收集；礼物/SC 不合并立即发
+                var firstIsMention = first.Kind == LiveKind.Danmaku && IsMention(first.Text, charName);
+                var batch = first.Kind == LiveKind.Danmaku && !firstIsMention && _mergeWindowMs > 0
+                    ? await CollectBatchAsync(ch.Reader, first, charName, ct)
                     : new List<LiveEvent> { first };
 
                 if (ct.IsCancellationRequested) return;
 
-                // 聊天未启用：丢弃（不占用管线）。GetPetInfo 异常按"启用"处理（SendEventAsync 会兜底返回 false）
-                bool chatEnabled;
-                try { chatEnabled = _ctx?.GetPetInfo()?.ChatEnabled != false; }
-                catch { chatEnabled = true; }
+                // 聊天未启用：丢弃（不占用管线）
                 if (!chatEnabled)
                 {
                     Interlocked.Add(ref _dropNoChat, batch.Count);
@@ -332,7 +352,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
                 var text = batch.Count == 1 ? LiveFormat.Format(batch[0]) : LiveFormat.FormatBatch(batch);
                 // 每事件指令：点名具体的人+事物（防参照旧上下文乱谢），经 SendEventAsync 拼进 user 触发词尾部——贴近决策点、遵循度高于 system 头部。
                 // 单条按类型点名感谢；合并批次必为弹幕 → 通用"是否回应/跳过"判断。
-                string? instruction = batch.Count == 1 ? BuildEventInstruction(batch[0]) : BaseEventInstruction;
+                string? instruction = batch.Count == 1 ? BuildEventInstruction(batch[0], charName) : BaseEventInstruction;
                 bool ok;
                 // SendEventAsync：以"叙述者事件"身份进入上下文（对模型是 system 而非 user），观众发言不会被当成用户说的话；
                 // allowAgent=false：观众内容是不可信输入，本轮不启用 agent 工具链——防注入电脑操作指令
@@ -361,15 +381,16 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
 
     /// <summary>
     /// 在 mergeWindowMs 内收拢后续弹幕成一批。严格保持 FIFO：
-    /// 队首一旦出现礼物/SC（TryPeek 非阻塞探测）立即停止收集，让下一轮单独发它。
+    /// 队首一旦出现礼物/SC/@点名弹幕（TryPeek 非阻塞探测）立即停止收集，让下一轮单独发它——
+    /// @点名必须独立成条、不与前面的弹幕合并。
     /// </summary>
-    private async Task<List<LiveEvent>> CollectBatchAsync(ChannelReader<LiveEvent> reader, LiveEvent first, CancellationToken ct)
+    private async Task<List<LiveEvent>> CollectBatchAsync(ChannelReader<LiveEvent> reader, LiveEvent first, string? charName, CancellationToken ct)
     {
         var batch = new List<LiveEvent> { first };
         var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(_mergeWindowMs);
         while (batch.Count < MaxMergeItems)
         {
-            if (reader.TryPeek(out var peeked) && peeked.Kind != LiveKind.Danmaku) break; // 礼物/SC 在队首：让位
+            if (reader.TryPeek(out var peeked) && (peeked.Kind != LiveKind.Danmaku || IsMention(peeked.Text, charName))) break; // 礼物/SC/@点名 在队首：让位单独发
             var remaining = deadline - DateTime.UtcNow;
             if (remaining <= TimeSpan.Zero) break;
 
@@ -434,6 +455,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
         if (TryBool(settings, "thankGift", out var tg)) _thankGift = tg;
         if (TryBool(settings, "thankSc", out var ts)) _thankSc = ts;
         if (TryBool(settings, "thankInteract", out var ti)) _thankInteract = ti;
+        if (TryBool(settings, "connectWhenNotLive", out var cw)) _connectWhenNotLive = cw;
         if (TryInt(settings, "minIntervalMs", 0, 60_000, out var mi)) _minIntervalMs = mi;
         if (TryInt(settings, "mergeWindowMs", 0, 10_000, out var mw)) _mergeWindowMs = mw;
         if (TryInt(settings, "maxQueue", 1, 500, out var mq)) _maxQueue = mq;

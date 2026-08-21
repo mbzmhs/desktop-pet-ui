@@ -102,9 +102,10 @@ internal sealed class BiliWsClient
 
     /// <summary>
     /// 连接主循环（阻塞至 ct 取消）：解析房间 → 取 token/线路 → 逐条线路尝试建连；
-    /// 异常/断线退避重连。未开播时不建连，周期复查。
+    /// 异常/断线退避重连。未开播时默认不建连、周期复查；connectWhenNotLive=true 则无视开播状态直接建连，
+    /// 主播一开播弹幕即送达（省去轮询延迟）。
     /// </summary>
-    public async Task RunAsync(int roomId, Action<LiveEvent> onEvent, CancellationToken ct)
+    public async Task RunAsync(int roomId, Action<LiveEvent> onEvent, bool connectWhenNotLive, CancellationToken ct)
     {
         var delayMs = 1_000;
         while (!ct.IsCancellationRequested)
@@ -112,12 +113,15 @@ internal sealed class BiliWsClient
             try
             {
                 var (internalId, uid, live) = await ResolveRoomAsync(roomId, ct);
-                if (!live)
+
+                if (!live && !connectWhenNotLive)
                 {
                     _log($"房间 {roomId} 当前未开播（uid={uid}），60s 后复查");
                     await Task.Delay(60_000, ct);
                     continue;
                 }
+                if (!live)
+                    _log($"房间 {roomId} 当前未开播（uid={uid}），已开启「未开播也连接」，直接建连等待开播");
 
                 var (myUid, buvid3, effCookie) = await EnsureIdentityAsync(ct);
                 var (token, hosts) = await _wbi.GetDanmuInfoAsync(internalId, effCookie, ct);
