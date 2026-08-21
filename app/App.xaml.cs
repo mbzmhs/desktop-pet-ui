@@ -556,7 +556,10 @@ public partial class App : System.Windows.Application
             if (app._chatPipeline == null || App.PetWindow == null) return Task.FromResult(false);
             try
             {
-                return app._chatPipeline.RunAsync(text, App.PetWindow!);
+                // 插件从后台线程调用：管线同步前缀会读 Window/UI 状态（WPF 线程亲和），
+                // 在 UI 线程执行到首个 await 即返回，异步部分自然在线程池继续
+                var win = App.PetWindow!;
+                return win.Dispatcher.Invoke(() => app._chatPipeline!.RunAsync(text, win));
             }
             catch (Exception ex)
             {
@@ -565,6 +568,17 @@ public partial class App : System.Windows.Application
             }
         }
 
-        public PetSnapshot GetPetInfo() => App.PetWindow?.GetSnapshot() ?? new PetSnapshot();
+        public PetSnapshot GetPetInfo()
+        {
+            var win = App.PetWindow;
+            if (win == null) return new PetSnapshot();
+            try
+            {
+                // WPF Window 属性（Left/Top/Width/Height 等）线程亲和：必须 UI 线程读
+                if (win.Dispatcher.CheckAccess()) return win.GetSnapshot();
+                return win.Dispatcher.Invoke(win.GetSnapshot);
+            }
+            catch { return new PetSnapshot(); }
+        }
     }
 }

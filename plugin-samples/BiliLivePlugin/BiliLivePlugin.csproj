@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>BiliLivePlugin</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 仓库内开发：直接引用 API 源码工程。第三方开发时改为引用程序目录 plugins\api\DesktopPetUi.PluginApi.dll -->
+    <ProjectReference Include="../../plugin-api/DesktopPetUi.PluginApi.csproj" />
+  </ItemGroup>
+
+</Project>

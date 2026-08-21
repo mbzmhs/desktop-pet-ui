@@ -7,6 +7,8 @@
         ShowInTaskbar="False"
         ResizeMode="CanResize"
         Topmost="True"
+        MinWidth="400" 
+        MinHeight="300"
         ShowActivated="True">
     <!-- WindowChrome：保留自定义标题栏，同时获得正常 Windows 窗体的行为（拖拽移动、双击最大化/还原、边缘缩放、Aero Snap） -->
     <WindowChrome.WindowChrome>
