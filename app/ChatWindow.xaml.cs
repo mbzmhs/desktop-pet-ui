@@ -103,6 +103,9 @@ public partial class ChatWindow : Window
         }
 
         _pipeline.Status = SetStatus;
+        // 停止按钮跟随 IsRunning：末次 Status("") 发出时 IsRunning 尚为 true，真正结束靠 finally 的这个事件——
+        // 插件触发的轮次（SendEventAsync）没有调用方兜底刷新，缺了它按钮会残留且点击无效
+        _pipeline.RunningChanged += _ => Dispatcher.BeginInvoke(new Action(UpdateStopButton));
         _pipeline.HistoryChanged += () => RebuildMessages();
         _pipeline.ReplyDelta += OnReplyDelta; // 流式打字（后台线程触发）
         _pipeline.ReplyStreamEnd += OnReplyStreamEnd;

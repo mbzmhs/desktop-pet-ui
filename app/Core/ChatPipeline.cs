@@ -37,6 +37,9 @@ public sealed class ChatPipeline : IDisposable
     private static readonly string[] WeekdaysEn = { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 
     public Action<string>? Status { get; set; }
+    /// <summary>IsRunning 变化时触发（finally 置 false 也触发）：UI 据此刷新停止按钮——
+    /// 插件触发的轮次没有调用方兜底刷新，末次 Status("") 发出时 IsRunning 尚为 true，只有这个事件能通知"真正结束"。</summary>
+    public Action<bool>? RunningChanged { get; set; }
     /// <summary>每次组装出最终系统提示词时回调（调试窗口展示用）。</summary>
     public Action<string>? SystemPromptDebug { get; set; }
     public Action<string>? DebugLog
@@ -484,6 +487,7 @@ public sealed class ChatPipeline : IDisposable
     {
         await _gate.WaitAsync();
         IsRunning = true;
+        RunningChanged?.Invoke(true);
         var cts = new CancellationTokenSource();
         _runCts = cts;
         try
@@ -554,6 +558,7 @@ public sealed class ChatPipeline : IDisposable
         {
             IsRunning = false;
             _runCts = null;
+            RunningChanged?.Invoke(false);
             cts.Dispose();
             _gate.Release();
         }
@@ -563,6 +568,7 @@ public sealed class ChatPipeline : IDisposable
     {
         await _gate.WaitAsync();
         IsRunning = true;
+        RunningChanged?.Invoke(true);
         var cts = new CancellationTokenSource();
         _runCts = cts;
         try
@@ -613,6 +619,7 @@ public sealed class ChatPipeline : IDisposable
         {
             IsRunning = false;
             _runCts = null;
+            RunningChanged?.Invoke(false);
             cts.Dispose();
             _gate.Release();
         }
