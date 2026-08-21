@@ -917,96 +917,40 @@ public sealed class ChatPipeline : IDisposable
             var sb = new StringBuilder();
             var lang = _config.EffectiveTextLang;
             List<ChatMessage> messages;
-            if (lang == "ja")
+            // 模板固定英文（结构/规则稳定、利于前缀缓存）；摘要正文按角色语言输出（lang→目标语言名），小节标题保持英文。
+            var contentLang = lang switch
             {
-                sb.AppendLine("以下の会話（以前の要約を含む）を日本語で構造化された記憶の要約に整理してください。必ず以下のセクションすべてを残して出力し、内容がなければ「（なし）」と書いてください：");
-                sb.AppendLine();
-                sb.AppendLine("## ユーザーとの関係");
-                sb.AppendLine("- 呼び方・好み・嫌いなもの・関係のトーン（具体的な名前はそのまま保持）");
-                sb.AppendLine("## 気分と約束");
-                sb.AppendLine("- 最近の気分；約束・取り決め（果たしていないものは必ず保持）；触れにくい話題");
-                sb.AppendLine("## 出来事");
-                sb.AppendLine("- 感情的に意味のある重要な出来事（日時+内容）、重複は統合可だが事実は落とさない");
-                sb.AppendLine("## agent操作");
-                sb.AppendLine("- 実行した主な操作（コマンド/パスはそのまま保持）、ユーザーが拒否した操作、信頼ディレクトリの変更");
-                sb.AppendLine("## 次の一手");
-                sb.AppendLine("- 未完の会話の糸口や未処理事項");
-                sb.AppendLine();
-                sb.AppendLine("ルール：短い箇条書きにすること（段落にしない）；具体的なパス・コマンド・ファイル名・人名をそのまま保持；要約本体のみ出力し、「要約」ということ自体には触れないこと。");
-                if (!string.IsNullOrWhiteSpace(prevSummary))
-                {
-                    sb.AppendLine("統合ルール：旧要約で果たしていない約束と長期的な好みは必ず引き継ぐこと；新旧が矛盾すれば新しい方を正とする。");
-                    sb.AppendLine("以前の要約：").AppendLine(prevSummary);
-                }
-                sb.AppendLine("要約する会話：");
-                foreach (var m in chunk) sb.Append(m.Role).Append(": ").Append(m.Content).AppendLine();
-
-                messages = new List<ChatMessage>
-                {
-                    new() { Role = "system", Content = "あなたは会話の記憶をまとめるアシスタントです。" },
-                    new() { Role = "user", Content = sb.ToString() },
-                };
-            }
-            else if (lang == "en")
+                "ja" => "Japanese",
+                "en" => "English",
+                _ => "Simplified Chinese",
+            };
+            sb.AppendLine("Summarize the conversation below (including any previous summary) into a structured memory summary. Write the summary CONTENT in " + contentLang + "; keep the section headings exactly as shown below (in English). Output exactly these sections, keeping every one (write \"(none)\" when empty):");
+            sb.AppendLine();
+            sb.AppendLine("## User & Relationship");
+            sb.AppendLine("- address, preferences, pet peeves, tone of the relationship (keep exact names verbatim)");
+            sb.AppendLine("## Mood & Commitments");
+            sb.AppendLine("- recent mood; promises and commitments (unfulfilled ones MUST be kept); sensitive topics");
+            sb.AppendLine("## What Happened");
+            sb.AppendLine("- important events with emotional significance (time + content); merge duplicates but never drop facts");
+            sb.AppendLine("## Agent Actions");
+            sb.AppendLine("- key operations performed (keep commands/paths verbatim), operations the user declined, trusted-dir changes");
+            sb.AppendLine("## Next Steps");
+            sb.AppendLine("- open threads or pending items");
+            sb.AppendLine();
+            sb.AppendLine("Rules: terse bullets, not prose; preserve exact paths, commands, file names and personal names; write the bullet content in " + contentLang + "; output only the summary itself, do not mention that a summary was made.");
+            if (!string.IsNullOrWhiteSpace(prevSummary))
             {
-                sb.AppendLine("Summarize the conversation below (including any previous summary) into a structured memory summary in English. Output exactly these sections, keeping every one (write \"(none)\" when empty):");
-                sb.AppendLine();
-                sb.AppendLine("## User & Relationship");
-                sb.AppendLine("- address, preferences, pet peeves, tone of the relationship (keep exact names verbatim)");
-                sb.AppendLine("## Mood & Commitments");
-                sb.AppendLine("- recent mood; promises and commitments (unfulfilled ones MUST be kept); sensitive topics");
-                sb.AppendLine("## What Happened");
-                sb.AppendLine("- important events with emotional significance (time + content); merge duplicates but never drop facts");
-                sb.AppendLine("## Agent Actions");
-                sb.AppendLine("- key operations performed (keep commands/paths verbatim), operations the user declined, trusted-dir changes");
-                sb.AppendLine("## Next Steps");
-                sb.AppendLine("- open threads or pending items");
-                sb.AppendLine();
-                sb.AppendLine("Rules: terse bullets, not prose; preserve exact paths, commands, file names and personal names; output only the summary itself, do not mention that a summary was made.");
-                if (!string.IsNullOrWhiteSpace(prevSummary))
-                {
-                    sb.AppendLine("Merge rules: carry forward unfulfilled commitments and long-term preferences from the prior summary; where old and new conflict, the newer wins.");
-                    sb.AppendLine("Previous summary:").AppendLine(prevSummary);
-                }
-                sb.AppendLine("Conversation to summarize:");
-                foreach (var m in chunk) sb.Append(m.Role).Append(": ").Append(m.Content).AppendLine();
-
-                messages = new List<ChatMessage>
-                {
-                    new() { Role = "system", Content = "You are an assistant that summarizes conversation memories." },
-                    new() { Role = "user", Content = sb.ToString() },
-                };
+                sb.AppendLine("Merge rules: carry forward unfulfilled commitments and long-term preferences from the prior summary; where old and new conflict, the newer wins.");
+                sb.AppendLine("Previous summary:").AppendLine(prevSummary);
             }
-            else
+            sb.AppendLine("Conversation to summarize:");
+            foreach (var m in chunk) sb.Append(m.Role).Append(": ").Append(m.Content).AppendLine();
+
+            messages = new List<ChatMessage>
             {
-                sb.AppendLine("请将下面的对话（包含之前的摘要）用简体中文整理成一份结构化的记忆摘要。严格按以下模板输出，保留所有小节（无内容写\"（无）\"）：");
-                sb.AppendLine();
-                sb.AppendLine("## 用户与关系");
-                sb.AppendLine("- 称呼、喜好、雷点、关系基调（具体名称原样保留）");
-                sb.AppendLine("## 情绪与约定");
-                sb.AppendLine("- 近期情绪基调；承诺与约定（未兑现的必须保留）；敏感话题");
-                sb.AppendLine("## 发生过的事");
-                sb.AppendLine("- 有情感意义的重要事件（时间+内容），可合并去重，但不要丢失事实");
-                sb.AppendLine("## agent操作");
-                sb.AppendLine("- 执行过的关键操作（命令/路径原样保留）、被用户拒绝的操作、信任目录变更");
-                sb.AppendLine("## 下一步");
-                sb.AppendLine("- 未完成的对话线索或待办");
-                sb.AppendLine();
-                sb.AppendLine("规则：使用简短要点，不要段落；原样保留具体路径、命令、文件名与人名；只输出摘要本身，不要提及\"摘要\"这件事。");
-                if (!string.IsNullOrWhiteSpace(prevSummary))
-                {
-                    sb.AppendLine("合并规则：旧摘要中未兑现的承诺与长期偏好必须带过；新旧冲突以新为准。");
-                    sb.AppendLine("之前的摘要：").AppendLine(prevSummary);
-                }
-                sb.AppendLine("需要摘要的对话：");
-                foreach (var m in chunk) sb.Append(m.Role).Append(": ").Append(m.Content).AppendLine();
-
-                messages = new List<ChatMessage>
-                {
-                    new() { Role = "system", Content = "你是负责整理对话记忆的助手。" },
-                    new() { Role = "user", Content = sb.ToString() },
-                };
-            }
+                new() { Role = "system", Content = "You are an assistant that summarizes conversation memories." },
+                new() { Role = "user", Content = sb.ToString() },
+            };
             var ep = _config.EffectiveLlm();
             // 摘要请求不携带完整历史，其 usage 不代表上下文占用，故不采样
             var result = await LlamaClient.CompleteAsync(
