@@ -35,7 +35,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
     private CancellationTokenSource? _dispCts;   // 分发器
     private Task? _dispTask;
     private LiveFilter _filter = new();
-    private int _dropFull, _dropNoChat, _sentCount, _skipCount;
+    private int _dropFull, _dropNoChat, _sentCount, _skipCount, _recvCount, _dispSeq;
 
     public BiliLivePlugin()
     {
@@ -56,8 +56,9 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
         RecreateChannel(_maxQueue);
 
         var cts = new CancellationTokenSource();
+        _dispCts?.Cancel(); // 热重注册：先停旧分发器，避免两个分发器并存抢事件/僵尸残留
         _dispCts = cts;
-        _dispTask = Task.Run(() => DispatcherAsync(cts.Token)); // 分发器常驻（无事件时空等）
+        _dispTask = Task.Run(() => DispatcherAsync(Interlocked.Increment(ref _dispSeq), cts.Token)); // 分发器常驻（无事件时空等）
 
         var roomDesc = string.IsNullOrWhiteSpace(_roomCode) ? "未配置" : _roomCode;
         ctx.Log($"注册成功（room={roomDesc}，弹幕={_respondDanmaku} 礼物={_respondGift} SC={_respondSc} 互动={_respondInteract}，合并窗口={_mergeWindowMs}ms，最小间隔={_minIntervalMs}ms）");
@@ -196,7 +197,7 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
         // UI 线程调用：只发取消信号，不等待（WS 会话在 finally 里 Abort，任务自行退出）
         _connCts?.Cancel();
         _dispCts?.Cancel();
-        _ctx?.Log($"已停止（累计回应 {_sentCount} 次、跳过 {_skipCount} 次；丢弃：队列满 {_dropFull}、聊天未启用 {_dropNoChat}）");
+        _ctx?.Log($"已停止（收到 {_recvCount}、累计回应 {_sentCount} 次、跳过 {_skipCount} 次；丢弃：队列满 {_dropFull}、聊天未启用 {_dropNoChat}）");
     }
 
     // ---------------- 连接引擎管理 ----------------
@@ -233,7 +234,9 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
     private void OnLiveEvent(LiveEvent e)
     {
         if (!_filter.Pass(e)) return;
+        var n = Interlocked.Increment(ref _recvCount);
         var ch = ChannelNow;
+        if (n <= 3 || n % 50 == 0) _ctx?.Log($"收到事件 #{n}（{e.Kind}）");
         if (!ch.Writer.TryWrite(e)) // 队列满：丢新保旧（FIFO 队首优先）
         {
             Interlocked.Increment(ref _dropFull);
@@ -243,9 +246,11 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
 
     // ---------------- 分发器（后台线程：FIFO + 合并 + 限频 → SendChatAsync） ----------------
 
-    private async Task DispatcherAsync(CancellationToken ct)
+    private async Task DispatcherAsync(int id, CancellationToken ct)
     {
         var lastSent = DateTime.MinValue;
+        var reads = 0;
+        _ctx?.Log($"分发器 #{id} 启动"); // 诊断：每次 Register 应恰好一个分发器
         try
         {
             while (!ct.IsCancellationRequested)
@@ -253,7 +258,8 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
                 var ch = ChannelNow;
                 LiveEvent first;
                 try { first = await ch.Reader.ReadAsync(ct); }
-                catch (ChannelClosedException) { continue; }
+                catch (ChannelClosedException) { _ctx?.Log($"分发器 #{id}：通道已关闭，退出"); continue; }
+                reads++;
 
                 // 最小间隔限频（管线本身串行，这里是防突发的下限）
                 if (_minIntervalMs > 0)
@@ -284,6 +290,8 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
                 bool ok;
                 // SendEventAsync：以"叙述者事件"身份进入上下文（对模型是 system 而非 user），观众发言不会被当成用户说的话；
                 // allowAgent=false：观众内容是不可信输入，本轮不启用 agent 工具链——防注入电脑操作指令
+                var t0 = DateTime.UtcNow;
+                _ctx?.Log($"发送事件（批次 {batch.Count} 条）…"); // 诊断：确认分发器到达发送点
                 try { ok = await _ctx!.SendEventAsync(text, false, ct); }
                 catch (Exception ex)
                 {
@@ -292,15 +300,17 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
                 }
                 Interlocked.Increment(ref _sentCount);
                 lastSent = DateTime.UtcNow;
+                _ctx?.Log($"发送完成（耗时 {(DateTime.UtcNow - t0).TotalSeconds:F1}s，ok={ok}）"); // 诊断：确认管线轮次真正结束
                 if (!ok) _ctx.Log("SendEventAsync 返回 false（聊天未启用/被停止），本条未回应");
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { _ctx?.Log($"分发器 #{id}：收到取消，退出（累计读到 {reads} 条）"); }
         catch (ChannelClosedException) { }
         catch (Exception ex)
         {
-            _ctx?.Log("分发器异常退出：" + ex.Message);
+            _ctx?.Log($"分发器 #{id} 异常退出：" + ex);
         }
+        _ctx?.Log($"分发器 #{id} 已退出（累计读到 {reads} 条、发送 {_sentCount} 次）"); // 诊断：任何退出路径必打
     }
 
     /// <summary>
@@ -317,16 +327,11 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
             var remaining = deadline - DateTime.UtcNow;
             if (remaining <= TimeSpan.Zero) break;
 
-            try
-            {
-                var readTask = reader.ReadAsync(ct).AsTask();
-                var slice = TimeSpan.FromMilliseconds(Math.Min(remaining.TotalMilliseconds, 200));
-                var finished = await Task.WhenAny(readTask, Task.Delay(slice, ct));
-                if (finished == readTask) batch.Add(await readTask);
-                // 否则只是等待片到期：回到循环顶重新探测队首与截止时间
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (ChannelClosedException) { break; }
+            if (reader.TryPeek(out _) && reader.TryRead(out var ev)) { batch.Add(ev); continue; } // 队首有弹幕：非阻塞直接取
+
+            // 队列空：等一个切片再探。注意——这里绝不能用 ReadAsync 挂等：
+            // 未 await 的挂起读会留在通道等待队列里，后续到达的事件会被这些"孤儿读"悄悄吞掉（分发器永远收不到）
+            await Task.Delay((int)Math.Min(remaining.TotalMilliseconds, 200), ct);
         }
         return batch;
     }
@@ -349,7 +354,8 @@ public sealed class BiliLivePlugin : IPlugin, ISystemPromptContributor
     {
         var old = ChannelNow;
         lock (_chanLock) _channel = Channel.CreateBounded<LiveEvent>(capacity);
-        if (old.Reader.TryPeek(out _)) _ctx?.Log("队列容量变更，未发出的旧事件已丢弃");
+        var pending = old.Reader.TryPeek(out _) ? "有" : "无";
+        _ctx?.Log($"通道重建 0x{old.GetHashCode():X}→0x{_channel.GetHashCode():X}（旧队列{pending}未发事件，已丢弃）"); // 诊断：恒打
     }
 
     private static HashSet<string> SplitList(string raw)
