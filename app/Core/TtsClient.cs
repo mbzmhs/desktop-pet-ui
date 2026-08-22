@@ -15,69 +15,87 @@ namespace DesktopPetUi.Core;
 public static class TtsClient
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(300) };
-    private static string? _voicesBase;
+    private static string? _modelsBase;
+    private static List<(string Id, string Display)>? _cachedModels;
+    private static string? _emoKey;
     private static HashSet<string>? _cachedEmotions;
-    private static List<(string Id, string Display)>? _cachedVoices;
 
-    /// <summary>当前激活音色可用的情感集合（首次查询后缓存）。失败时返回仅含 neutral 的集合。</summary>
-    public static async Task<HashSet<string>> GetAvailableEmotionsAsync(string baseUrl, CancellationToken ct = default)
+    /// <summary>指定角色（model）可用的情感集合，GET /v1/models/{model}/voices。按 (baseUrl,model) 缓存；失败/无 model 时返回仅含 neutral。</summary>
+    public static async Task<HashSet<string>> GetAvailableEmotionsAsync(string baseUrl, string? model = null, CancellationToken ct = default)
     {
-        if (_voicesBase == baseUrl && _cachedEmotions != null) return _cachedEmotions;
+        var key = baseUrl + "|" + (model ?? "");
+        if (_emoKey == key && _cachedEmotions != null) return _cachedEmotions;
         try
         {
-            var url = baseUrl.TrimEnd('/') + "/voices";
-            using var resp = await Http.GetAsync(url, ct);
-            if (resp.IsSuccessStatusCode)
+            HashSet<string>? set = null;
+            if (!string.IsNullOrWhiteSpace(model))
             {
-                var json = await resp.Content.ReadAsStringAsync(ct);
-                using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-                if (root.TryGetProperty("data", out var data) &&
-                    data.TryGetProperty("active_voice", out var av) && av.ValueKind == JsonValueKind.String &&
-                    data.TryGetProperty("voices", out var voices) &&
-                    voices.TryGetProperty(av.GetString() ?? "", out var voice) &&
-                    voice.TryGetProperty("emotions", out var emo) && emo.ValueKind == JsonValueKind.Object)
+                // 指定角色：/v1/models/{model}/voices -> data[].id
+                var url = baseUrl.TrimEnd('/') + "/v1/models/" + Uri.EscapeDataString(model) + "/voices";
+                using var resp = await Http.GetAsync(url, ct);
+                if (resp.IsSuccessStatusCode)
                 {
-                    var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    foreach (var kv in emo.EnumerateObject()) set.Add(kv.Name);
-                    _voicesBase = baseUrl;
-                    _cachedEmotions = set;
-                    return set;
+                    var json = await resp.Content.ReadAsStringAsync(ct);
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+                    {
+                        set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var v in data.EnumerateArray())
+                            if (v.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(idEl.GetString()))
+                                set.Add(idEl.GetString()!);
+                    }
                 }
             }
+            else
+            {
+                // 未指定角色（合成时服务端回退 active_voice）：取 /v1/models 全部角色的情感并集，避免误限制
+                var url = baseUrl.TrimEnd('/') + "/v1/models";
+                using var resp = await Http.GetAsync(url, ct);
+                if (resp.IsSuccessStatusCode)
+                {
+                    var json = await resp.Content.ReadAsStringAsync(ct);
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
+                    {
+                        set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var m in data.EnumerateArray())
+                            if (m.TryGetProperty("emotions", out var emo) && emo.ValueKind == JsonValueKind.Array)
+                                foreach (var e in emo.EnumerateArray())
+                                    if (e.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(e.GetString()))
+                                        set.Add(e.GetString()!);
+                    }
+                }
+            }
+            if (set != null && set.Count > 0) { _emoKey = key; _cachedEmotions = set; return set; }
         }
         catch { }
         return new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "neutral" };
     }
 
-    /// <summary>从 tts-server 的 /voices 接口读取所有可选音色（首次查询后缓存）。返回 (原始ID, 显示名)。</summary>
+    /// <summary>从 OpenAI 兼容 /v1/models 读取所有可选角色（首次查询后缓存）。返回 (原始ID, 显示名)。</summary>
     public static async Task<List<(string Id, string Display)>> GetAvailableVoicesAsync(string baseUrl, CancellationToken ct = default)
     {
         var list = new List<(string Id, string Display)>();
-        if (_voicesBase == baseUrl && _cachedVoices != null) return _cachedVoices;
+        if (_modelsBase == baseUrl && _cachedModels != null) return _cachedModels;
         try
         {
-            var url = baseUrl.TrimEnd('/') + "/voices";
+            var url = baseUrl.TrimEnd('/') + "/v1/models";
             using var resp = await Http.GetAsync(url, ct);
             if (resp.IsSuccessStatusCode)
             {
                 var json = await resp.Content.ReadAsStringAsync(ct);
                 using var doc = JsonDocument.Parse(json);
-                var root = doc.RootElement;
-                if (root.TryGetProperty("data", out var data) &&
-                    data.TryGetProperty("voices", out var voices) && voices.ValueKind == JsonValueKind.Object)
+                if (doc.RootElement.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Array)
                 {
-                    foreach (var kv in voices.EnumerateObject())
+                    foreach (var m in data.EnumerateArray())
                     {
-                        var id = kv.Name;
+                        if (!m.TryGetProperty("id", out var idEl) || idEl.ValueKind != JsonValueKind.String) continue;
+                        var id = idEl.GetString() ?? "";
+                        if (string.IsNullOrWhiteSpace(id)) continue;
                         var display = id;
-                        if (kv.Value.ValueKind == JsonValueKind.Object &&
-                            kv.Value.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String &&
-                            !string.IsNullOrWhiteSpace(name.GetString()) &&
-                            !string.Equals(name.GetString(), id, StringComparison.Ordinal))
-                        {
-                            display = id + "（" + name.GetString()!.Trim() + "）";
-                        }
+                        var name = FirstString(m, "name", "desc", "description");
+                        if (!string.IsNullOrWhiteSpace(name) && !string.Equals(name.Trim(), id, StringComparison.Ordinal))
+                            display = id + "（" + name.Trim() + "）";
                         list.Add((id, display));
                     }
                 }
@@ -86,8 +104,8 @@ public static class TtsClient
         catch { }
         if (list.Count > 0)
         {
-            _voicesBase = baseUrl;
-            _cachedVoices = list;
+            _modelsBase = baseUrl;
+            _cachedModels = list;
         }
         return list;
     }
@@ -102,15 +120,15 @@ public static class TtsClient
         if (string.Equals(cfg.Provider, "windows", StringComparison.OrdinalIgnoreCase))
             return await SynthesizeWindowsAsync(text, cfg, ct);
 
-        var url = baseUrl.TrimEnd('/') + "/tts";
+        var url = baseUrl.TrimEnd('/') + "/v1/audio/speech";
         var payload = new
         {
-            text = text,
-            text_lang = cfg.TextLang,
-            voice_id = string.IsNullOrEmpty(cfg.VoiceId) ? null : cfg.VoiceId,
-            emotion = string.IsNullOrEmpty(emotion) ? cfg.Emotion : emotion,
-            speed_factor = cfg.SpeedFactor,
-            media_type = "wav",
+            model = string.IsNullOrEmpty(cfg.VoiceId) ? null : cfg.VoiceId,
+            input = text,
+            voice = string.IsNullOrEmpty(emotion) ? cfg.Emotion : emotion,
+            response_format = "wav",
+            speed = cfg.SpeedFactor,
+            language = cfg.TextLang,
         };
         using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
         using var resp = await Http.PostAsync(url, content, ct);
@@ -136,17 +154,16 @@ public static class TtsClient
         bool stopPrev = false,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var url = baseUrl.TrimEnd('/') + "/tts";
+        var url = baseUrl.TrimEnd('/') + "/v1/audio/speech?stream=true";
         var payload = new
         {
-            text = text,
-            text_lang = cfg.TextLang,
-            voice_id = string.IsNullOrEmpty(cfg.VoiceId) ? null : cfg.VoiceId,
-            emotion = string.IsNullOrEmpty(emotion) ? cfg.Emotion : emotion,
-            speed_factor = cfg.SpeedFactor,
-            media_type = "wav",
-            streaming = true,
-            stop_prev = stopPrev,
+            model = string.IsNullOrEmpty(cfg.VoiceId) ? null : cfg.VoiceId,
+            input = text,
+            voice = string.IsNullOrEmpty(emotion) ? cfg.Emotion : emotion,
+            response_format = "wav",
+            speed = cfg.SpeedFactor,
+            language = cfg.TextLang,
+            stream = true,
         };
         using var req = new HttpRequestMessage(HttpMethod.Post, url)
         {
@@ -158,6 +175,7 @@ public static class TtsClient
             var body = await resp.Content.ReadAsStringAsync(ct);
             throw new Exception($"TTS 流式请求失败 ({resp.StatusCode}): {Truncate(body, 300)}");
         }
+        // 服务端流式按句下发"带独立 RIFF 头的完整 WAV 段"，逐段取出即可边收边播。（stopPrev 新协议无对应，忽略。）
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
         var pending = new MemoryStream();
         var buffer = new byte[81920];
@@ -196,6 +214,15 @@ public static class TtsClient
         src.SetLength(rest);
         src.Position = rest;
         return true;
+    }
+
+    /// <summary>按顺序取第一个非空字符串属性值，均无则返回 null。</summary>
+    private static string? FirstString(JsonElement el, params string[] names)
+    {
+        foreach (var n in names)
+            if (el.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(v.GetString()))
+                return v.GetString();
+        return null;
     }
 
     /// <summary>把多个 WAV 段按序拼接成一个合法 WAV（去掉各段 RIFF 头、合并数据区，更新文件大小）。</summary>

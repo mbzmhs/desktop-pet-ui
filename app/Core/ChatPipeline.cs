@@ -419,7 +419,7 @@ public sealed class ChatPipeline : IDisposable
             return;
         }
         if (_availableEmotions != null && (DateTime.UtcNow - _emotionsFetchedAt).TotalSeconds < 60) return;
-        _availableEmotions = await TtsClient.GetAvailableEmotionsAsync(tts.Url);
+        _availableEmotions = await TtsClient.GetAvailableEmotionsAsync(tts.Url, tts.VoiceId);
         _emotionsFetchedAt = DateTime.UtcNow;
         if (_availableEmotions != null && _availableEmotions.Count > 0)
             DebugLog?.Invoke("[" + DateTime.Now.ToString("HH:mm:ss") + "] 可用情感: " + string.Join(", ", _availableEmotions.OrderBy(x => x)));
